@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Credentials and local configuration
+.env
+.env.*
+*.pem
+*.key
+*.crt
+
+# Virtual environment
+.venv/
+
+# Project outputs
+outputs/
+*.iso
+*.ucs
+*.scf
+*.qkview
+*.tar
+*.xlsx
+
+.DS_Store
