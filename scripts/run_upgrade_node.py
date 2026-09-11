@@ -619,7 +619,7 @@ def main() -> int:
         f"{node_count} Nodes."
     )
 
-    manage_auto_sync(
+    auto_sync_groups = manage_auto_sync(
         client,
         enable=False,
         prompt=(
@@ -725,9 +725,11 @@ def main() -> int:
     manage_auto_sync(
         client,
         enable=True,
+        groups=auto_sync_groups,
         prompt=(
-            "Auto-sync is disabled. Re-enable auto-sync before collecting "
-            "the post-upgrade state?"
+            "Auto-sync was disabled by this upgrade workflow. Re-enable "
+            "it for those same device groups before collecting the "
+            "post-upgrade state?"
         ),
     )
 

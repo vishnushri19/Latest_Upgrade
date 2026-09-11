@@ -80,56 +80,68 @@ def manage_auto_sync(
     *,
     enable: bool,
     prompt: str,
-) -> bool:
+    groups: Optional[list[str]] = None,
+) -> list[str]:
     """
-    Optionally enable or disable auto-sync for all configured device groups.
+    Optionally change auto-sync for the selected device groups.
 
-    Returns True when the requested transition was completed or was not
-    needed. A declined prompt is treated as an intentional no-op.
+    When ``groups`` is omitted, the groups currently in the requested source
+    state are selected. The returned names are the groups changed by this
+    invocation, allowing a later phase to restore only those groups.
+    A declined prompt is treated as an intentional no-op.
     """
     states = _device_group_auto_sync_states(client)
     current_state = "disabled" if enable else "enabled"
     target_state = "enabled" if enable else "disabled"
-    groups = [
+    requested_groups = (
+        groups
+        if groups is not None
+        else [
+            name
+            for name, state in states.items()
+            if state == current_state
+        ]
+    )
+    groups_to_change = [
         name
-        for name, state in states.items()
-        if state == current_state
+        for name in requested_groups
+        if states.get(name) == current_state
     ]
-    if not groups:
+    if not groups_to_change:
         print(
             f"[i] Auto-sync is already {'enabled' if enable else 'disabled'} "
-            "for all device groups."
+            "for the applicable device groups."
         )
-        return True
+        return []
 
     print("\n" + prompt)
     print("Affected device groups:")
-    for group in groups:
+    for group in groups_to_change:
         print(f"  - {group}")
 
     if not sys.stdin.isatty():
         print("[i] Non-interactive terminal; leaving auto-sync unchanged.")
-        return True
+        return []
 
     try:
         answer = input("Continue? (y/N): ").strip().lower()
     except (EOFError, KeyboardInterrupt):
         print("[i] Auto-sync unchanged.")
-        return True
+        return []
 
     if answer not in ("y", "yes"):
         print("[i] Auto-sync unchanged; continuing.")
-        return True
+        return []
 
     state = "enabled" if enable else "disabled"
-    for group in groups:
+    for group in groups_to_change:
         client.patch(
             f"/mgmt/tm/cm/device-group/{quote(group, safe='')}",
             {"autoSync": state},
         )
 
     if not enable:
-        for group in groups:
+        for group in groups_to_change:
             command = (
                 "tmsh run cm config-sync to-group "
                 f"{shlex.quote(group)}"
@@ -147,14 +159,14 @@ def manage_auto_sync(
     final_states = _device_group_auto_sync_states(client)
     mismatched = {
         group: final_states.get(group, "")
-        for group in groups
+        for group in groups_to_change
         if final_states.get(group, "") != target_state
     }
     if mismatched:
         raise RuntimeError(
             f"Auto-sync verification failed. Expected {state} for "
-            f"{groups}, mismatched states: {mismatched}"
+            f"{groups_to_change}, mismatched states: {mismatched}"
         )
 
     print(f"[+] Auto-sync {state} and verified.")
-    return True
+    return groups_to_change
