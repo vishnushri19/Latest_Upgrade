@@ -60,6 +60,37 @@ class StateCollector:
                 f"{type(exc).__name__}: {exc}"
             )
 
+    def display_ltm_health_summary(self) -> None:
+        """
+        Display the operator-facing LTM health summary used during upgrades.
+
+        These are read-only commands. The output is informational; the
+        structured pre/post checks remain authoritative for pass/fail status.
+        """
+        commands = [
+            (
+                'tmsh -q -c "cd / ; list ltm pool recursive" '
+                '| grep "state up" | wc -l'
+            ),
+            (
+                'tmsh -q -c "cd / ; list ltm pool recursive" '
+                '| grep "state " | sort | uniq -c'
+            ),
+            (
+                'tmsh -q -c "cd / ; show ltm virtual recursive" '
+                '| grep -i "State\\|Availability" | sort | uniq -c'
+            ),
+        ]
+
+        print("\n" + "-" * 75)
+        print("LTM HEALTH SUMMARY (informational)")
+        print("-" * 75)
+        for command in commands:
+            print(f"\n$ {command}")
+            output = self.run_tmsh(command)
+            print(output or "(no output)")
+        print("-" * 75 + "\n")
+
     def collect_all_state(self) -> Dict[str, Any]:
         """Collects structured state plus raw all-partition LTM evidence."""
         return {
@@ -540,4 +571,3 @@ class StateCollector:
             return True
         except ImportError:
             return False
-

@@ -646,6 +646,8 @@ def main() -> int:
         "& Prechecks..."
     )
 
+    StateCollector(client).display_ltm_health_summary()
+
     flow = UpgradeFlow(
         client=client,
         options=FlowOptions(
