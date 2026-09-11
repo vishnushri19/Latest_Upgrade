@@ -57,6 +57,64 @@ class DiffEngine:
                 "pre_node_count": len(self.pre.get("nodes", [])),
                 "post_node_count": len(self.post.get("nodes", [])),
             },
+            "health_summary": {
+                "pre": self._health_summary(self.pre),
+                "post": self._health_summary(self.post),
+            },
+        }
+
+    @staticmethod
+    def _health_summary(state: Dict[str, Any]) -> Dict[str, Any]:
+        def summarize(category: str) -> Dict[str, Any]:
+            items = state.get(category, [])
+            summary: Dict[str, Any] = {
+                "total": len(items),
+                "availability": {},
+                "enabled": {},
+                "unknown": [],
+                "offline": [],
+                "disabled": [],
+            }
+
+            for item in items:
+                name = str(item.get("name", "")).strip()
+                availability = str(item.get("availabilityState", "")).strip() or "unknown"
+                enabled = str(item.get("enabledState", "")).strip() or "unknown"
+                availability_key = availability.lower()
+                enabled_key = enabled.lower()
+
+                summary["availability"][availability_key] = (
+                    summary["availability"].get(availability_key, 0) + 1
+                )
+                summary["enabled"][enabled_key] = (
+                    summary["enabled"].get(enabled_key, 0) + 1
+                )
+
+                if availability_key in ("unknown", ""):
+                    summary["unknown"].append(name)
+                elif "offline" in availability_key:
+                    summary["offline"].append(name)
+                if "disabled" in enabled_key:
+                    summary["disabled"].append(name)
+
+            return summary
+
+        interfaces = state.get("interface_stats", [])
+        interface_up = [
+            str(item.get("tmName", "")).strip()
+            for item in interfaces
+            if str(item.get("status", "")).strip().lower() == "up"
+        ]
+
+        return {
+            "interfaces": {
+                "total": len(interfaces),
+                "up_count": len(interface_up),
+                "up_names": interface_up,
+            },
+            "virtual_servers": summarize("virtual_servers"),
+            "pools": summarize("pools"),
+            "nodes": summarize("nodes"),
         }
 
     def _diff_objects(self, category: str, key: str, state_field: str) -> List[Dict[str, Any]]:
@@ -232,6 +290,10 @@ class DiffEngine:
             f"",
         ]
 
+        health = diff_result.get("health_summary", {})
+        lines.extend(self._health_markdown("Pre-Upgrade Health", health.get("pre", {})))
+        lines.extend(self._health_markdown("Post-Upgrade Health", health.get("post", {})))
+
         # Critical Section
         all_diffs = (
             diff_result.get("virtual_servers", [])
@@ -272,3 +334,58 @@ class DiffEngine:
         lines.append("")
 
         return "\n".join(lines)
+
+    @staticmethod
+    def _health_markdown(title: str, health: Dict[str, Any]) -> List[str]:
+        lines = [f"## {title}", ""]
+        interfaces = health.get("interfaces", {})
+        lines.extend(
+            [
+                f"- **Interfaces up:** {interfaces.get('up_count', 0)} of "
+                f"{interfaces.get('total', 0)}",
+                f"- **Interface names up:** "
+                f"{', '.join(f'`{name}`' for name in interfaces.get('up_names', [])) or 'None'}",
+                "",
+                "| Object Type | Total | Availability Counts | Unknown | Offline | Disabled |",
+                "| :--- | ---: | :--- | ---: | ---: | ---: |",
+            ]
+        )
+
+        for key, label in (
+            ("virtual_servers", "Virtual Servers"),
+            ("pools", "Pools"),
+            ("nodes", "Nodes"),
+        ):
+            item = health.get(key, {})
+            availability = item.get("availability", {})
+            lines.append(
+                f"| **{label}** | {item.get('total', 0)} | "
+                f"{', '.join(f'{state}: {count}' for state, count in sorted(availability.items())) or 'None'} | "
+                f"{len(item.get('unknown', []))} | {len(item.get('offline', []))} | "
+                f"{len(item.get('disabled', []))} |"
+            )
+
+        lines.extend(["", "### Object Names Requiring Attention", ""])
+        attention_found = False
+        for key, label in (
+            ("virtual_servers", "Virtual Servers"),
+            ("pools", "Pools"),
+            ("nodes", "Nodes"),
+        ):
+            item = health.get(key, {})
+            for field, display in (
+                ("unknown", "unknown"),
+                ("offline", "offline"),
+                ("disabled", "disabled"),
+            ):
+                names = item.get(field, [])
+                if names:
+                    attention_found = True
+                    lines.append(
+                        f"- **{label} {display}:** "
+                        f"{', '.join(f'`{name}`' for name in names)}"
+                    )
+        if not attention_found:
+            lines.append("- None")
+        lines.append("")
+        return lines

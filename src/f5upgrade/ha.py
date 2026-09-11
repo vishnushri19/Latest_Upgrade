@@ -3,9 +3,9 @@ from __future__ import annotations
 import shlex
 import sys
 from typing import Any, Optional
-from urllib.parse import quote
 
 from .bigip_client import BigIPClient
+from .discovery import discover_devices
 
 
 AUTO_SYNC_EXCLUDED_GROUPS = frozenset({"device_trust_group"})
@@ -75,6 +75,55 @@ def _device_group_auto_sync_states(
     return result
 
 
+def _local_device_group(
+    client: BigIPClient,
+    states: dict[str, str],
+) -> Optional[str]:
+    """
+    Select the single device-group associated with this local device.
+
+    Device-group names in this environment begin with the local device
+    hostname (for example, ``bip2...`` or ``bip0...``). Never fall back to
+    all groups: a discovery failure must not broaden the scope of an
+    auto-sync change.
+    """
+    local_name, devices = discover_devices(client)
+    candidates = [local_name or ""]
+
+    for device in devices:
+        if device.get("name") == local_name:
+            candidates.extend(
+                [
+                    str(device.get("hostname") or ""),
+                    str(device.get("name") or ""),
+                ]
+            )
+
+    prefixes = {
+        value.strip().lower().split(".", 1)[0]
+        for value in candidates
+        if value and value.strip()
+    }
+    matches = [
+        name
+        for name in states
+        if any(name.lower().startswith(prefix) for prefix in prefixes)
+    ]
+
+    if len(matches) > 1:
+        raise RuntimeError(
+            "More than one local device-group matched the local device "
+            f"{sorted(matches)}. Refusing to change auto-sync."
+        )
+    if not matches:
+        print(
+            "[i] No device-group matching the local device hostname was "
+            "found; leaving auto-sync unchanged."
+        )
+        return None
+    return matches[0]
+
+
 def manage_auto_sync(
     client: BigIPClient,
     *,
@@ -85,23 +134,19 @@ def manage_auto_sync(
     """
     Optionally change auto-sync for the selected device groups.
 
-    When ``groups`` is omitted, the groups currently in the requested source
-    state are selected. The returned names are the groups changed by this
-    invocation, allowing a later phase to restore only those groups.
+    When ``groups`` is omitted, only the group whose name starts with the
+    local device hostname is selected. The returned names are the groups
+    changed by this invocation, allowing a later phase to restore only those
+    groups.
     A declined prompt is treated as an intentional no-op.
     """
     states = _device_group_auto_sync_states(client)
     current_state = "disabled" if enable else "enabled"
     target_state = "enabled" if enable else "disabled"
-    requested_groups = (
-        groups
-        if groups is not None
-        else [
-            name
-            for name, state in states.items()
-            if state == current_state
-        ]
-    )
+    requested_groups = groups
+    if requested_groups is None:
+        local_group = _local_device_group(client, states)
+        requested_groups = [local_group] if local_group else []
     groups_to_change = [
         name
         for name in requested_groups
@@ -135,10 +180,18 @@ def manage_auto_sync(
 
     state = "enabled" if enable else "disabled"
     for group in groups_to_change:
-        client.patch(
-            f"/mgmt/tm/cm/device-group/{quote(group, safe='')}",
-            {"autoSync": state},
+        response = client.run_bash(
+            "tmsh modify cm device-group "
+            f"{shlex.quote(group)} auto-sync {state}"
         )
+        output = str(response.get("commandResult", "")).strip()
+        if output and any(
+            marker in output.lower()
+            for marker in ("error", "failed", "syntax", "invalid", "conflict")
+        ):
+            raise RuntimeError(
+                f"Could not set auto-sync {state} for {group}: {output}"
+            )
 
     if not enable:
         for group in groups_to_change:
