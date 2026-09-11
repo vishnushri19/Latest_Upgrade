@@ -87,8 +87,8 @@ def main() -> int:
         results, meta={"bigip_host": settings.host, "mode": "ha_recovery"}
     )
 
-    out_dir = Path("outputs")
-    out_dir.mkdir(exist_ok=True)
+    out_dir = Path("outputs") / settings.crq_number
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     safe_host = settings.host.replace(":", "_").replace("/", "_")
     json_path = out_dir / f"ha_recovery_report_{safe_host}.json"

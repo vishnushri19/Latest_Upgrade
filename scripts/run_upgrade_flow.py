@@ -39,8 +39,8 @@ def main() -> int:
         },
     )
 
-    outdir = Path("outputs")
-    outdir.mkdir(exist_ok=True)
+    outdir = Path("outputs") / settings.crq_number
+    outdir.mkdir(parents=True, exist_ok=True)
     safe_host = settings.host.replace(":", "_").replace("/", "_")
 
     json_path = outdir / f"upgrade_flow_report_{safe_host}.json"

@@ -90,20 +90,24 @@ make install
 - export BIGIP_HOST="10.0.0.10"
 - export BIGIP_USER="admin"
 - export BIGIP_PASS="password"
+- export CRQ_NUMBER="CRQ123456"
 - export BIGIP_VERIFY_TLS="false"
 - export TARGET_IMAGE_CONTAINS="21.0.0.1"
 - export TARGET_VOLUME="HD1.2"
 - export AUTO_UPLOAD_ISO="true"
 - export ISO_LOCAL_PATH="/path/to/BIGIP-21.0.0.1-0.0.13.iso"
+- # For a combined base image + engineering hotfix install, use both instead:
+- export BASE_ISO_LOCAL_PATH="/path/to/BIGIP-16.1.4.1.iso"
+- export HOTFIX_ISO_LOCAL_PATH="/path/to/Hotfix-BIGIP-16.1.4.1.0.50.5-ENG.iso"
 - export SCP_USER="admin"  
 
 ### Run Prechecks
-Writes reports to outputs/ in both JSON and Markdown.
+Writes reports to outputs/<CRQ_NUMBER>/ in both JSON and Markdown.
 make prechecks
 
 ### Outputs:
-outputs/precheck_report_<host>.json
-outputs/precheck_report_<host>.md
+outputs/<CRQ_NUMBER>/precheck_report_<host>.json
+outputs/<CRQ_NUMBER>/precheck_report_<host>.md
 
 ### Run Upgrade Flow (Skeleton)
 This runs the controlled upgrade flow on the standby node:
@@ -117,10 +121,10 @@ This runs the controlled upgrade flow on the standby node:
 
 ### Output Reports
 Reports are generated in:
-outputs/precheck_report_<host>.json
-outputs/precheck_report_<host>.md
-outputs/upgrade_flow_report_<host>.json
-outputs/upgrade_flow_report_<host>.md
+outputs/<CRQ_NUMBER>/precheck_report_<host>.json
+outputs/<CRQ_NUMBER>/precheck_report_<host>.md
+outputs/<CRQ_NUMBER>/upgrade_flow_report_<host>.json
+outputs/<CRQ_NUMBER>/upgrade_flow_report_<host>.md
 
 - If `EXEC-IMG-001` fails, see `docs/prereq-image.md` (includes `scripts/upload_iso.sh`).
 
@@ -162,5 +166,4 @@ Senior F5 engineers managing production environments
 Organizations planning major BIG-IP version upgrades
 
 It is not intended as a beginner tutorial or quick-start upgrade guide.
-
 

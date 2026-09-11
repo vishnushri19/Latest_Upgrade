@@ -923,10 +923,31 @@ def exec_upload_iso_standby(
         )
 
 
+def exec_upload_files_standby(
+    client: BigIPClient,
+    host: str,
+    scp_user: str,
+    iso_local_paths: list[str],
+) -> list[CheckResult]:
+    """Upload multiple ISO files sequentially, verifying each upload."""
+    return [
+        exec_upload_iso_standby(
+            client,
+            host=host,
+            scp_user=scp_user,
+            iso_local_path=path,
+        )
+        for path in iso_local_paths
+    ]
+
+
 def exec_install_standby(
     client: BigIPClient,
     image_iso_name: str,
     target_volume: str,
+    *,
+    force_install: bool = False,
+    create_volume: Optional[bool] = None,
 ) -> CheckResult:
     """
     Submit image installation to the target standby volume.
@@ -988,7 +1009,7 @@ def exec_install_standby(
             "validating",
         ]
 
-        if version_matches and any(
+        if not force_install and version_matches and any(
             state in status
             for state in progress_states
         ):
@@ -1015,23 +1036,24 @@ def exec_install_standby(
                 },
             )
 
-        return CheckResult(
-            id=result_id,
-            category="Execution",
-            name=result_name,
-            status="FAIL",
-            details={
-                "role": role,
-                "image": image_iso_name,
-                "chosen_volume": target_volume,
-                "error": (
-                    "Target volume already exists but does "
-                    "not contain the expected target version."
-                ),
-                "expected_version": expected_version,
-                "volume_state": existing.__dict__,
-            },
-        )
+        if not force_install:
+            return CheckResult(
+                id=result_id,
+                category="Execution",
+                name=result_name,
+                status="FAIL",
+                details={
+                    "role": role,
+                    "image": image_iso_name,
+                    "chosen_volume": target_volume,
+                    "error": (
+                        "Target volume already exists but does "
+                        "not contain the expected target version."
+                    ),
+                    "expected_version": expected_version,
+                    "volume_state": existing.__dict__,
+                },
+            )
 
     image_name = os.path.basename(image_iso_name.strip())
     if not image_name or image_name != image_iso_name.strip():
@@ -1052,6 +1074,8 @@ def exec_install_standby(
         )
 
     install_type = "hotfix" if _is_hotfix_image(image_name) else "image"
+    if create_volume is None:
+        create_volume = not existing.found
 
     # BIG-IP 17.5 accepts the image filename with the volume property. Run
     # from /shared/images so tmsh can resolve the file without treating an
@@ -1061,9 +1085,10 @@ def exec_install_standby(
         f"cd /shared/images && "
         f"tmsh install sys software {install_type} "
         f"{_shell_quote(image_name)} "
-        f"volume {_shell_quote(target_volume)} "
-        f"create-volume"
+        f"volume {_shell_quote(target_volume)}"
     )
+    if create_volume:
+        tmsh_command += " create-volume"
 
     print(
         "\nSubmitting BIG-IP software install command:"

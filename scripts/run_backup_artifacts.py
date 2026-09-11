@@ -471,7 +471,7 @@ def main() -> int:
     run_timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
 
     output_dir = (
-        Path("outputs")
+        Path("outputs") / cfg.crq_number
         / "evidence"
         / f"backup_{safe_host}_{run_timestamp}"
     )

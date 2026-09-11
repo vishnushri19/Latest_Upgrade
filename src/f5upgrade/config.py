@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import getpass
 import os
+import re
 import sys
 from dataclasses import dataclass
 
@@ -14,6 +15,7 @@ class Settings:
     password: str
     verify_tls: bool = False
     timeout: int = 20
+    crq_number: str = ""
 
     # Upgrade intent
     target_image_contains: str = "21.0.0.1"
@@ -22,6 +24,8 @@ class Settings:
     # Automation
     auto_upload_iso: bool = False
     iso_local_path: str = ""
+    base_iso_local_path: str = ""
+    hotfix_iso_local_path: str = ""
     scp_user: str = ""  # default to username if empty
 
 
@@ -61,6 +65,7 @@ def load_settings() -> Settings:
     Required:
       - BIGIP_HOST
       - BIGIP_USER
+      - CRQ_NUMBER
       - BIGIP_PASS (if not set in env, will prompt securely via getpass)
 
     Optional:
@@ -70,11 +75,19 @@ def load_settings() -> Settings:
       - TARGET_VOLUME            (e.g. HD1.2)
       - AUTO_UPLOAD_ISO          (0/1/true/yes)
       - ISO_LOCAL_PATH           (path to ISO on local machine)
+      - BASE_ISO_LOCAL_PATH      (optional base ISO for combined EHF install)
+      - HOTFIX_ISO_LOCAL_PATH    (optional EHF ISO for combined install)
       - SCP_USER                 (defaults to BIGIP_USER if empty)
+      - CRQ_NUMBER               (safe folder name under outputs/)
     """
     # Required
     host = _req("BIGIP_HOST")
     username = _req("BIGIP_USER")
+    crq_number = _req("CRQ_NUMBER")
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", crq_number):
+        raise ValueError(
+            "CRQ_NUMBER may contain only letters, numbers, hyphens, and underscores."
+        )
     password = _get_password()
 
     # Optional / with defaults
@@ -97,6 +110,8 @@ def load_settings() -> Settings:
         "yes",
     )
     iso_local_path = os.getenv("ISO_LOCAL_PATH", "").strip()
+    base_iso_local_path = os.getenv("BASE_ISO_LOCAL_PATH", "").strip()
+    hotfix_iso_local_path = os.getenv("HOTFIX_ISO_LOCAL_PATH", "").strip()
 
     scp_user = os.getenv("SCP_USER", "").strip() or username
 
@@ -106,9 +121,12 @@ def load_settings() -> Settings:
         password=password,
         verify_tls=verify_tls,
         timeout=timeout,
+        crq_number=crq_number,
         target_image_contains=target_image_contains,
         target_volume=target_volume,
         auto_upload_iso=auto_upload_iso,
         iso_local_path=iso_local_path,
+        base_iso_local_path=base_iso_local_path,
+        hotfix_iso_local_path=hotfix_iso_local_path,
         scp_user=scp_user,
     )

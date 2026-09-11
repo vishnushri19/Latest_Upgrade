@@ -22,8 +22,8 @@ def main() -> int:
     results = run_prechecks(client)
     report = to_report(results, meta={"bigip_host": cfg.host, "mode": "prechecks"})
 
-    out_dir = Path("outputs")
-    out_dir.mkdir(exist_ok=True)
+    out_dir = Path("outputs") / cfg.crq_number
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     safe_host = cfg.host.replace(":", "_").replace("/", "_")
     out_path = out_dir / f"precheck_report_{safe_host}.json"
@@ -42,4 +42,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

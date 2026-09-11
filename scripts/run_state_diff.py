@@ -21,10 +21,11 @@ def run_collection(
     collector: StateCollector,
     host: str,
     phase: str,
+    output_root: Path,
     do_backup: bool = False,
 ) -> Path:
     safe_h = _safe_host(host)
-    out_dir = Path("outputs") / "snapshots"
+    out_dir = output_root / "snapshots"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     json_path = out_dir / f"{phase}_state_{safe_h}.json"
@@ -63,7 +64,12 @@ def run_collection(
     return json_path
 
 
-def run_diff(pre_json_path: Path, post_json_path: Path, host: str) -> int:
+def run_diff(
+    pre_json_path: Path,
+    post_json_path: Path,
+    host: str,
+    output_root: Path,
+) -> int:
     print(f"\n[*] Comparing Pre vs Post Upgrade States...")
     print(f"    Pre file:  {pre_json_path}")
     print(f"    Post file: {post_json_path}")
@@ -78,8 +84,8 @@ def run_diff(pre_json_path: Path, post_json_path: Path, host: str) -> int:
     diff_results = engine.compare()
 
     # Save Diff JSON & Markdown
-    out_dir = Path("outputs")
-    out_dir.mkdir(exist_ok=True)
+    out_dir = output_root
+    out_dir.mkdir(parents=True, exist_ok=True)
     safe_h = _safe_host(host)
 
     diff_json_path = out_dir / f"diff_report_{safe_h}.json"
@@ -167,7 +173,8 @@ def main() -> int:
     collector = StateCollector(client)
 
     safe_h = _safe_host(cfg.host)
-    snapshots_dir = Path("outputs") / "snapshots"
+    output_root = Path("outputs") / cfg.crq_number
+    snapshots_dir = output_root / "snapshots"
 
     if args.phase:
         if args.phase == "post":
@@ -183,6 +190,7 @@ def main() -> int:
             collector,
             host=cfg.host,
             phase=args.phase,
+            output_root=output_root,
             do_backup=args.backup or (args.phase == "pre"),
         )
 
@@ -197,7 +205,7 @@ def main() -> int:
             print(f"[-] Error: Post-state file not found at {post_file}. Run with --phase post first.")
             return 1
 
-        return run_diff(pre_file, post_file, cfg.host)
+        return run_diff(pre_file, post_file, cfg.host, output_root)
 
     if not args.phase and not args.compare:
         parser.print_help()

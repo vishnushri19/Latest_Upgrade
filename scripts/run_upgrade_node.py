@@ -545,7 +545,7 @@ def main() -> int:
 
     collector = StateCollector(client)
 
-    output_dir = Path("outputs")
+    output_dir = Path("outputs") / settings.crq_number
     snapshots_dir = output_dir / "snapshots"
     backups_dir = output_dir / "backups"
 

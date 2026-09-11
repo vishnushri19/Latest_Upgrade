@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 from dataclasses import dataclass
 from typing import List, Optional
@@ -10,8 +11,8 @@ from .config import Settings
 from .execution import (
     check_image_present,
     exec_install_standby,
+    exec_upload_files_standby,
     exec_reboot_to_volume_standby,
-    exec_upload_iso_standby,
     exec_volume_ready,
     exec_wait_postboot,
     prepare_install_storage,
@@ -221,10 +222,22 @@ class UpgradeFlow:
             return results
 
         # --- Execution: prepare storage before image upload/install ---
+        combined_ehf = bool(
+            self.settings.base_iso_local_path
+            and self.settings.hotfix_iso_local_path
+        )
+        upload_paths = [
+            path
+            for path in (
+                self.settings.base_iso_local_path,
+                self.settings.hotfix_iso_local_path,
+            )
+            if path
+        ] or ([self.settings.iso_local_path] if self.settings.iso_local_path else [])
         storage_result = prepare_install_storage(
             self.client,
             self.settings.target_volume,
-            require_upload_space=self.settings.auto_upload_iso,
+            require_upload_space=self.settings.auto_upload_iso and bool(upload_paths),
             expected_image_contains=self.settings.target_image_contains,
         )
         results.append(storage_result)
@@ -232,21 +245,41 @@ class UpgradeFlow:
             return results
 
         # --- Execution: ensure image present on standby ---
-        img = check_image_present(self.client, self.settings.target_image_contains)
-        if not img.found and self.settings.auto_upload_iso:
-            results.append(
-                exec_upload_iso_standby(
-                    self.client,
-                    host=self.settings.host,
-                    scp_user=self.settings.scp_user,
-                    iso_local_path=self.settings.iso_local_path,
-                )
+        if self.settings.auto_upload_iso and upload_paths:
+            upload_results = exec_upload_files_standby(
+                self.client,
+                host=self.settings.host,
+                scp_user=self.settings.scp_user,
+                iso_local_paths=upload_paths,
             )
+            results.extend(upload_results)
             if self.should_stop(results):
                 return results
 
-        # Re-check image presence
-        img = check_image_present(self.client, self.settings.target_image_contains)
+        expected_names = [
+            os.path.basename(path)
+            for path in upload_paths
+        ]
+        if combined_ehf:
+            expected_names = [expected_names[-1]]
+        img = check_image_present(
+            self.client,
+            expected_names[0] if expected_names else self.settings.target_image_contains,
+        )
+        if combined_ehf:
+            base_name = os.path.basename(self.settings.base_iso_local_path)
+            base_img = check_image_present(self.client, base_name)
+            results.append(
+                CheckResult(
+                    id="EXEC-BASE-IMG-001",
+                    category="Execution Readiness",
+                    name="Matching base image presence verified",
+                    status="PASS" if base_img.found else "FAIL",
+                    details=base_img.details,
+                )
+            )
+            if not base_img.found or self.should_stop(results):
+                return results
         results.append(
             CheckResult(
                 id="EXEC-IMG-001",
@@ -259,7 +292,10 @@ class UpgradeFlow:
         if not img.found or self.should_stop(results):
             return results
 
-        if not self._confirm_install(img.matched_name or "", self.settings.target_volume):
+        if not img.found or not self._confirm_install(
+            img.matched_name or "",
+            self.settings.target_volume,
+        ):
             results.append(
                 CheckResult(
                     id="EXEC-CONFIRM-001",
@@ -278,12 +314,24 @@ class UpgradeFlow:
             )
             return results
 
+        install_name = img.matched_name or ""
+        force_install = combined_ehf or (
+            bool(install_name)
+            and install_name.lower().startswith("hotfix-bigip-")
+        )
+        volume_state = storage_result.details.get("volume_state", {})
+        create_volume = not bool(volume_state) and not bool(
+            storage_result.details.get("deleted_volume")
+        )
+
         # Install to target volume (standby only)
         results.append(
             exec_install_standby(
                 self.client,
-                img.matched_name,
+                install_name,
                 self.settings.target_volume,
+                force_install=force_install,
+                create_volume=create_volume,
             )
         )
         if self.should_stop(results):

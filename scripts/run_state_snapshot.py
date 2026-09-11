@@ -41,7 +41,7 @@ def main() -> int:
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     safe_host = _safe_host(cfg.host)
 
-    out_dir = Path("outputs") / "state"
+    out_dir = Path("outputs") / cfg.crq_number / "state"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     json_path = out_dir / f"{phase}_state_{safe_host}_{timestamp}.json"

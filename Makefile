@@ -65,6 +65,7 @@ setup:
 check-env:
 	@test -n "$$BIGIP_HOST" || (echo "ERROR: BIGIP_HOST is not set"; exit 2)
 	@test -n "$$BIGIP_USER" || (echo "ERROR: BIGIP_USER is not set"; exit 2)
+	@test -n "$$CRQ_NUMBER" || (echo "ERROR: CRQ_NUMBER is not set"; exit 2)
 	@test -n "$$TARGET_IMAGE_CONTAINS" || (echo "ERROR: TARGET_IMAGE_CONTAINS is not set"; exit 2)
 	@test -n "$$TARGET_VOLUME" || (echo "ERROR: TARGET_VOLUME is not set"; exit 2)
 
@@ -89,4 +90,3 @@ clean-outputs:
 	rm -rf outputs
 	mkdir -p outputs
 	find . -type d -name "__pycache__" -prune -exec rm -rf {} +
-
