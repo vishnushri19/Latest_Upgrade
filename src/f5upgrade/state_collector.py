@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from .bigip_client import BigIPClient
 
@@ -114,7 +115,41 @@ class StateCollector:
             "route_domains": self._collect_route_domains(),
             "interface_stats": self._collect_interfaces(),
             "system_performance": self._collect_performance(),
+            "crypto_inventory": self._collect_crypto_inventory(),
             "ltm_raw_all_partitions": self._collect_ltm_raw_all_partitions(),
+        }
+
+    def _collect_crypto_inventory(self) -> Dict[str, Any]:
+        """Collect non-FIPS certificate/key counts and FIPS key counts only."""
+        cert_output = self.run_tmsh(
+            'tmsh -q -c "cd /; list sys file ssl-cert" | wc -l'
+        )
+        key_output = self.run_tmsh(
+            'tmsh -q -c "cd /; list sys file ssl-key" | wc -l'
+        )
+        fips_output = self.run_tmsh("tmsh show sys crypto fips key")
+
+        def parse_count(output: str) -> Optional[int]:
+            match = re.search(r"(?m)^\s*(\d+)\s*$", output or "")
+            return int(match.group(1)) if match else None
+
+        fips_counts: Dict[str, int] = {}
+        for label, count in re.findall(
+            r"(?im)^\s*(private keys|public keys)\s*\((\d+)\)",
+            fips_output or "",
+        ):
+            fips_counts[label.lower()] = int(count)
+
+        return {
+            "non_fips": {
+                "ssl_cert_count": parse_count(cert_output),
+                "ssl_key_count": parse_count(key_output),
+            },
+            "fips": {
+                "private_key_count": fips_counts.get("private keys"),
+                "public_key_count": fips_counts.get("public keys"),
+                "raw_output": fips_output,
+            },
         }
 
     # ---------------- Common Helpers ----------------

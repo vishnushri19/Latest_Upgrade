@@ -61,6 +61,10 @@ class DiffEngine:
                 "pre": self._health_summary(self.pre),
                 "post": self._health_summary(self.post),
             },
+            "crypto_inventory": {
+                "pre": self.pre.get("crypto_inventory", {}),
+                "post": self.post.get("crypto_inventory", {}),
+            },
         }
 
     @staticmethod
@@ -293,6 +297,12 @@ class DiffEngine:
         health = diff_result.get("health_summary", {})
         lines.extend(self._health_markdown("Pre-Upgrade Health", health.get("pre", {})))
         lines.extend(self._health_markdown("Post-Upgrade Health", health.get("post", {})))
+        lines.extend(
+            self._crypto_markdown(
+                diff_result.get("crypto_inventory", {}).get("pre", {}),
+                diff_result.get("crypto_inventory", {}).get("post", {}),
+            )
+        )
 
         # Critical Section
         all_diffs = (
@@ -334,6 +344,46 @@ class DiffEngine:
         lines.append("")
 
         return "\n".join(lines)
+
+    @staticmethod
+    def _crypto_markdown(
+        pre: Dict[str, Any],
+        post: Dict[str, Any],
+    ) -> List[str]:
+        def values(inventory: Dict[str, Any]) -> Dict[str, Any]:
+            non_fips = inventory.get("non_fips", {})
+            fips = inventory.get("fips", {})
+            return {
+                "SSL certificates": non_fips.get("ssl_cert_count"),
+                "SSL keys": non_fips.get("ssl_key_count"),
+                "FIPS private keys": fips.get("private_key_count"),
+                "FIPS public keys": fips.get("public_key_count"),
+            }
+
+        pre_values = values(pre)
+        post_values = values(post)
+        lines = [
+            "## Cryptographic Inventory",
+            "",
+            "| Item | Pre-Upgrade | Post-Upgrade |",
+            "| :--- | ---: | ---: |",
+        ]
+        for label in pre_values:
+            before = pre_values[label]
+            after = post_values[label]
+            lines.append(
+                f"| **{label}** | {before if before is not None else 'N/A'} | "
+                f"{after if after is not None else 'N/A'} |"
+            )
+        lines.extend(
+            [
+                "",
+                "FIPS key output is retained in snapshots for audit review; "
+                "private key material is never collected.",
+                "",
+            ]
+        )
+        return lines
 
     @staticmethod
     def _health_markdown(title: str, health: Dict[str, Any]) -> List[str]:
