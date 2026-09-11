@@ -5,6 +5,7 @@ import os
 import re
 import shlex
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
@@ -366,6 +367,250 @@ def check_image_present(
                 for image in available_images
             ),
         },
+    )
+
+
+def _is_hotfix_image(image_name: str) -> bool:
+    return os.path.basename(image_name).lower().startswith("hotfix-bigip-")
+
+
+def prepare_install_storage(
+    client: BigIPClient,
+    target_volume: str,
+    *,
+    require_upload_space: bool,
+    expected_image_contains: str = "",
+) -> CheckResult:
+    """
+    Display storage state and safely prepare an inactive target volume.
+
+    The filesystem containing /shared/images must have at least 8 GiB free
+    when an upload is requested. The active boot volume is never deleted.
+    """
+    result_id = "EXEC-STORAGE-001"
+    result_name = "Storage and target volume readiness"
+    details: Dict[str, Any] = {"target_volume": target_volume}
+
+    try:
+        role = (get_failover_role(client) or "").lower()
+    except Exception as exc:
+        return CheckResult(
+            id=result_id,
+            category="Execution Readiness",
+            name=result_name,
+            status="FAIL",
+            details={"error": f"Could not determine failover role: {exc}"},
+        )
+
+    if role != "standby":
+        return CheckResult(
+            id=result_id,
+            category="Execution Readiness",
+            name=result_name,
+            status="FAIL",
+            details={"error": "Storage preparation requires a STANDBY device.", "role": role},
+        )
+
+    if require_upload_space:
+        response = client.run_bash(
+            "df -Pk /shared/images",
+            timeout=60,
+        )
+        df_output = _remote_command_output(response)
+        details["disk_usage"] = df_output
+        data_lines = [
+            line.split()
+            for line in df_output.splitlines()
+            if line.strip() and not line.lower().startswith("filesystem")
+        ]
+        if not data_lines or len(data_lines[-1]) < 5:
+            return CheckResult(
+                id=result_id,
+                category="Execution Readiness",
+                name=result_name,
+                status="FAIL",
+                details={**details, "error": "Could not parse free space for /shared/images."},
+            )
+        try:
+            available_kib = int(data_lines[-1][3])
+        except ValueError:
+            return CheckResult(
+                id=result_id,
+                category="Execution Readiness",
+                name=result_name,
+                status="FAIL",
+                details={**details, "error": "Free-space value from df was not numeric."},
+            )
+        required_kib = 8 * 1024 * 1024
+        available_gib = available_kib / (1024 * 1024)
+        print(
+            f"\n/shared/images filesystem free space: {available_gib:.2f} GiB "
+            "(minimum 8.00 GiB)"
+        )
+        if available_kib < required_kib:
+            return CheckResult(
+                id=result_id,
+                category="Execution Readiness",
+                name=result_name,
+                status="FAIL",
+                details={
+                    **details,
+                    "available_gib": round(available_gib, 2),
+                    "required_gib": 8,
+                    "error": "Insufficient free space to upload the ISO.",
+                },
+            )
+
+    image_response = client.run_bash(
+        "ls -lh /shared/images/ 2>/dev/null | head -n 500",
+        timeout=60,
+    )
+    image_listing = _remote_command_output(image_response)
+    details["image_listing"] = image_listing
+    print("\nImages under /shared/images:")
+    print(image_listing or "(none)")
+
+    image_names_response = client.run_bash(
+        "find /shared/images -maxdepth 1 -type f -name '*.iso' -printf '%f\\n' "
+        "| sort",
+        timeout=60,
+    )
+    image_names = [
+        line.strip()
+        for line in _remote_command_output(image_names_response).splitlines()
+        if line.strip() and os.path.basename(line.strip()) == line.strip()
+    ]
+    if image_names:
+        print("\nNumbered ISO files:")
+        for index, name in enumerate(image_names, 1):
+            print(f"  {index}. {name}")
+        if sys.stdin.isatty():
+            answer = input(
+                "Delete any ISO files? Enter numbers separated by commas, or press Enter to keep all: "
+            ).strip()
+            if answer:
+                try:
+                    selected = sorted({int(item.strip()) for item in answer.split(",")})
+                    if any(index < 1 or index > len(image_names) for index in selected):
+                        raise IndexError
+                    selected_names = [image_names[index - 1] for index in selected]
+                except (ValueError, IndexError):
+                    return CheckResult(
+                        id=result_id,
+                        category="Execution Readiness",
+                        name=result_name,
+                        status="FAIL",
+                        details={**details, "error": "Invalid ISO deletion selection."},
+                    )
+                print("Selected ISO files:")
+                for name in selected_names:
+                    print(f"  - {name}")
+                confirm = input("Confirm deletion? (y/N): ").strip().lower()
+                if confirm in ("y", "yes"):
+                    for name in selected_names:
+                        client.run_bash(
+                            f"rm -f -- {_shell_quote('/shared/images/' + name)}",
+                            timeout=60,
+                        )
+
+    volume_response = client.run_bash(
+        "tmsh show sys software",
+        timeout=60,
+    )
+    volume_listing = _remote_command_output(volume_response)
+    details["volume_listing"] = volume_listing
+    print("\nAvailable software volumes:")
+    print(volume_listing or "(none)")
+
+    existing = _get_volume_state(client, target_volume)
+    if not existing.found:
+        return CheckResult(
+            id=result_id,
+            category="Execution Readiness",
+            name=result_name,
+            status="PASS",
+            details=details,
+        )
+
+    if existing.active.strip().lower() in ("yes", "true", "active"):
+        return CheckResult(
+            id=result_id,
+            category="Execution Readiness",
+            name=result_name,
+            status="FAIL",
+            details={
+                **details,
+                "volume_state": existing.__dict__,
+                "error": f"{target_volume} is the active boot volume and cannot be deleted.",
+            },
+        )
+
+    if (
+        expected_image_contains
+        and expected_image_contains.lower() in existing.version.lower()
+        and "complete" in existing.status.lower()
+    ):
+        print(
+            f"\nTarget volume {target_volume} already contains the requested "
+            f"version {existing.version}; it will be reused."
+        )
+        details["volume_state"] = existing.__dict__
+        details["reused_volume"] = True
+        return CheckResult(
+            id=result_id,
+            category="Execution Readiness",
+            name=result_name,
+            status="PASS",
+            details=details,
+        )
+
+    print(
+        f"\nTarget volume {target_volume} contains version "
+        f"{existing.version or '(unknown)'} with status '{existing.status}'."
+    )
+    if not sys.stdin.isatty():
+        return CheckResult(
+            id=result_id,
+            category="Execution Readiness",
+            name=result_name,
+            status="FAIL",
+            details={**details, "volume_state": existing.__dict__, "error": "Target volume cleanup requires confirmation."},
+        )
+
+    answer = input(
+        f"Delete and recreate inactive volume {target_volume}? (y/N): "
+    ).strip().lower()
+    if answer not in ("y", "yes"):
+        return CheckResult(
+            id=result_id,
+            category="Execution Readiness",
+            name=result_name,
+            status="FAIL",
+            details={**details, "volume_state": existing.__dict__, "error": "Target volume replacement was not confirmed."},
+        )
+
+    delete_output = _remote_command_output(
+        client.run_bash(
+            f"tmsh delete sys software volume {_shell_quote(target_volume)}",
+            timeout=120,
+        )
+    )
+    if _is_fatal_tmsh_output(delete_output):
+        return CheckResult(
+            id=result_id,
+            category="Execution Readiness",
+            name=result_name,
+            status="FAIL",
+            details={**details, "volume_state": existing.__dict__, "delete_output": delete_output},
+        )
+
+    details["deleted_volume"] = target_volume
+    return CheckResult(
+        id=result_id,
+        category="Execution Readiness",
+        name=result_name,
+        status="PASS",
+        details=details,
     )
 
 
@@ -806,13 +1051,15 @@ def exec_install_standby(
             },
         )
 
+    install_type = "hotfix" if _is_hotfix_image(image_name) else "image"
+
     # BIG-IP 17.5 accepts the image filename with the volume property. Run
     # from /shared/images so tmsh can resolve the file without treating an
     # absolute path as a slot ID.
     image_path = f"/shared/images/{image_name}"
     tmsh_command = (
         f"cd /shared/images && "
-        f"tmsh install sys software image "
+        f"tmsh install sys software {install_type} "
         f"{_shell_quote(image_name)} "
         f"volume {_shell_quote(target_volume)} "
         f"create-volume"
@@ -845,6 +1092,7 @@ def exec_install_standby(
                 details={
                     "role": role,
                     "image": image_iso_name,
+                    "install_type": install_type,
                     "image_path": image_path,
                     "chosen_volume": target_volume,
                     "tmsh": tmsh_command,
@@ -864,6 +1112,7 @@ def exec_install_standby(
             details={
                 "role": role,
                 "image": image_iso_name,
+                "install_type": install_type,
                 "image_path": image_path,
                 "chosen_volume": target_volume,
                 "tmsh": tmsh_command,
@@ -884,6 +1133,7 @@ def exec_install_standby(
             details={
                 "role": role,
                 "image": image_iso_name,
+                "install_type": install_type,
                 "image_path": image_path,
                 "chosen_volume": target_volume,
                 "tmsh": tmsh_command,

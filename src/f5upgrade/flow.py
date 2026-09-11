@@ -14,6 +14,7 @@ from .execution import (
     exec_upload_iso_standby,
     exec_volume_ready,
     exec_wait_postboot,
+    prepare_install_storage,
 )
 from .ha import get_failover_role
 from .report import CheckResult
@@ -217,6 +218,17 @@ class UpgradeFlow:
                     details={"error": str(e)},
                 )
             )
+            return results
+
+        # --- Execution: prepare storage before image upload/install ---
+        storage_result = prepare_install_storage(
+            self.client,
+            self.settings.target_volume,
+            require_upload_space=self.settings.auto_upload_iso,
+            expected_image_contains=self.settings.target_image_contains,
+        )
+        results.append(storage_result)
+        if self.should_stop(results):
             return results
 
         # --- Execution: ensure image present on standby ---
