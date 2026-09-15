@@ -543,7 +543,11 @@ def main() -> int:
         timeout=settings.timeout,
     )
 
-    collector = StateCollector(client)
+    collector = StateCollector(
+        client,
+        crq_number=settings.crq_number,
+        phase="pre",
+    )
 
     output_dir = Path("outputs") / settings.crq_number
     snapshots_dir = output_dir / "snapshots"
@@ -585,6 +589,7 @@ def main() -> int:
     )
 
     pre_state = collector.collect_all_state()
+    collector.save_operational_evidence(pre_state, output_dir)
 
     collector.save_snapshot_json(
         pre_state,
@@ -717,12 +722,35 @@ def main() -> int:
         )
         return 0
 
+    print(
+        "\n[+] SOFTWARE UPGRADE COMPLETED SUCCESSFULLY"
+        "\n    Installation, volume readiness, standby reboot, and post-boot "
+        "validation completed."
+    )
+
     # -------------------------------------------------------------------------
     # STAGE 3: POST-UPGRADE STATE COLLECTION
     # -------------------------------------------------------------------------
     print(
         "\n[STAGE 3/4] Collecting Post-Upgrade State..."
     )
+
+    stabilization_seconds = 180
+    print(
+        "\nWaiting "
+        f"{stabilization_seconds} seconds for VIPs, pools, and nodes "
+        "to stabilize before post-upgrade checks..."
+    )
+    for elapsed in range(1, stabilization_seconds + 1):
+        print(
+            f"\rStabilization timer: {elapsed}/{stabilization_seconds} seconds",
+            end="",
+            flush=True,
+        )
+        time.sleep(1)
+    print()
+    print("\n[+] Stabilization wait completed.")
+    StateCollector(client).display_ltm_health_summary()
 
     manage_auto_sync(
         client,
@@ -745,7 +773,9 @@ def main() -> int:
         / f"post_state_{safe_host}.xlsx"
     )
 
+    collector.phase = "post"
     post_state = collector.collect_all_state()
+    collector.save_operational_evidence(post_state, output_dir)
 
     collector.save_snapshot_json(
         post_state,

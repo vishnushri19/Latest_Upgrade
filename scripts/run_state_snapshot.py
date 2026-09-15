@@ -36,7 +36,11 @@ def main() -> int:
         timeout=cfg.timeout,
     )
 
-    collector = StateCollector(client)
+    collector = StateCollector(
+        client,
+        crq_number=cfg.crq_number,
+        phase=phase,
+    )
 
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     safe_host = _safe_host(cfg.host)
@@ -66,7 +70,9 @@ def main() -> int:
             ),
         )
 
+    collector.display_ltm_health_summary()
     state = collector.collect_all_state()
+    collector.save_operational_evidence(state, out_dir.parent)
 
     collector.save_snapshot_json(state, json_path)
     excel_written = collector.save_snapshot_excel(state, xlsx_path)

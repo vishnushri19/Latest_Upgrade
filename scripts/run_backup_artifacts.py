@@ -134,7 +134,7 @@ class SSHSession:
             "-o",
             "StrictHostKeyChecking=accept-new",
             self.target,
-            "true",
+            f"bash -lc {shlex.quote('true')}",
         ]
 
         try:
@@ -157,11 +157,12 @@ class SSHSession:
         timeout_sec: int,
     ) -> subprocess.CompletedProcess[str]:
         """Run a command over SSH."""
+        remote_command = f"bash -lc {shlex.quote(command)}"
         ssh_command = [
             "ssh",
             *self._base_opts(),
             self.target,
-            command,
+            remote_command,
         ]
 
         return subprocess.run(

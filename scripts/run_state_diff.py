@@ -32,7 +32,9 @@ def run_collection(
     xlsx_path = out_dir / f"{phase}_state_{safe_h}.xlsx"
 
     print(f"\n[*] Collecting {phase.upper()} upgrade state from {host} (all 13 REST tables)...")
+    collector.display_ltm_health_summary()
     state = collector.collect_all_state()
+    collector.save_operational_evidence(state, output_root)
 
     collector.save_snapshot_json(state, json_path)
     print(f"[+] Saved {phase.upper()} state JSON: {json_path}")
@@ -170,7 +172,11 @@ def main() -> int:
         verify_tls=cfg.verify_tls,
         timeout=cfg.timeout,
     )
-    collector = StateCollector(client)
+    collector = StateCollector(
+        client,
+        crq_number=cfg.crq_number,
+        phase=args.phase or "snapshot",
+    )
 
     safe_h = _safe_host(cfg.host)
     output_root = Path("outputs") / cfg.crq_number

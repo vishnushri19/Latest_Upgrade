@@ -24,8 +24,16 @@ class StateCollector:
         so objects outside /Common are included.
     """
 
-    def __init__(self, client: BigIPClient) -> None:
+    def __init__(
+        self,
+        client: BigIPClient,
+        *,
+        crq_number: str = "",
+        phase: str = "",
+    ) -> None:
         self.client = client
+        self.crq_number = crq_number
+        self.phase = phase
 
     def get_entries(self, endpoint: str) -> Dict[str, Any]:
         """Query an endpoint and safely return the nested 'entries' dictionary."""
@@ -116,8 +124,100 @@ class StateCollector:
             "interface_stats": self._collect_interfaces(),
             "system_performance": self._collect_performance(),
             "crypto_inventory": self._collect_crypto_inventory(),
+            "bgp_inventory": self._collect_bgp_inventory(),
+            "operational_evidence": self._collect_operational_evidence(),
             "ltm_raw_all_partitions": self._collect_ltm_raw_all_partitions(),
         }
+
+    def _collect_operational_evidence(self) -> Dict[str, str]:
+        """Collect ASM association and ARP evidence without changing state."""
+        phase = self.phase or "snapshot"
+        asm_command = "tmsh list asm policy blocking-mode virtual-servers"
+        if self.crq_number:
+            safe_name = f"{self.crq_number}_{phase}_asm_assoc.txt"
+            asm_command = (
+                f"{asm_command} > /shared/tmp/{safe_name} && "
+                f"cat /shared/tmp/{safe_name}"
+            )
+
+        return {
+            "asm_blocking_mode_virtual_servers": self.run_tmsh(asm_command),
+            "arp": self.run_tmsh("tmsh show net arp"),
+        }
+
+    def save_operational_evidence(
+        self,
+        state: Dict[str, Any],
+        output_dir: Path,
+    ) -> None:
+        """Write raw ASM and ARP evidence beside the phase snapshot."""
+        evidence = state.get("operational_evidence", {})
+        evidence_dir = output_dir / "evidence"
+        evidence_dir.mkdir(parents=True, exist_ok=True)
+        phase = self.phase or "snapshot"
+        for key, suffix in (
+            ("asm_blocking_mode_virtual_servers", "asm_assoc"),
+            ("arp", "arp"),
+        ):
+            path = evidence_dir / f"{self.crq_number}_{phase}_{suffix}.txt"
+            path.write_text(str(evidence.get(key, "")), encoding="utf-8")
+
+    def _collect_bgp_inventory(self) -> Dict[str, Any]:
+        """
+        Collect BGP evidence for route domain 0 when BGP is enabled there.
+
+        The summary is parsed for neighbor addresses; advertised routes are
+        then collected for every discovered neighbor.
+        """
+        route_domain_output = self.run_tmsh("tmsh list net route-domain")
+        route_domain_zero = re.search(
+            r"(?ims)^\s*net route-domain 0\s*\{(.*?)(?=^\s*net route-domain\b|\Z)",
+            route_domain_output,
+        )
+        route_domain_zero_output = (
+            route_domain_zero.group(1)
+            if route_domain_zero
+            else ""
+        )
+        result: Dict[str, Any] = {
+            "route_domain": 0,
+            "enabled": bool(
+                re.search(
+                    r"(?im)^\s*routing-protocol\s*\{[^}]*\bBGP\b",
+                    route_domain_zero_output,
+                )
+            ),
+            "route_domain_output": route_domain_output,
+            "route_domain_zero_output": route_domain_zero_output,
+            "run_config": "",
+            "summary": "",
+            "neighbors": [],
+            "advertised_routes": {},
+        }
+
+        if not result["enabled"]:
+            return result
+
+        result["run_config"] = self.run_tmsh('imish -e "show run"')
+        summary = self.run_tmsh('imish -e "show ip bgp summary"')
+        result["summary"] = summary
+
+        neighbor_ips = sorted(
+            set(
+                re.findall(
+                    r"(?m)^\s*(\d{1,3}(?:\.\d{1,3}){3})\s+\d+\s+\d+",
+                    summary,
+                )
+            )
+        )
+        result["neighbors"] = neighbor_ips
+        result["advertised_routes"] = {
+            neighbor: self.run_tmsh(
+                f'imish -e "show ip bgp neighbors {neighbor} advertised-routes"'
+            )
+            for neighbor in neighbor_ips
+        }
+        return result
 
     def _collect_crypto_inventory(self) -> Dict[str, Any]:
         """Collect non-FIPS certificate/key counts and FIPS key counts only."""

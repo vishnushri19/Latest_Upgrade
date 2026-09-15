@@ -65,6 +65,10 @@ class DiffEngine:
                 "pre": self.pre.get("crypto_inventory", {}),
                 "post": self.post.get("crypto_inventory", {}),
             },
+            "bgp_inventory": {
+                "pre": self.pre.get("bgp_inventory", {}),
+                "post": self.post.get("bgp_inventory", {}),
+            },
         }
 
     @staticmethod
@@ -303,6 +307,12 @@ class DiffEngine:
                 diff_result.get("crypto_inventory", {}).get("post", {}),
             )
         )
+        lines.extend(
+            self._bgp_markdown(
+                diff_result.get("bgp_inventory", {}).get("pre", {}),
+                diff_result.get("bgp_inventory", {}).get("post", {}),
+            )
+        )
 
         # Critical Section
         all_diffs = (
@@ -384,6 +394,31 @@ class DiffEngine:
             ]
         )
         return lines
+
+    @staticmethod
+    def _bgp_markdown(
+        pre: Dict[str, Any],
+        post: Dict[str, Any],
+    ) -> List[str]:
+        if not pre.get("enabled") and not post.get("enabled"):
+            return ["## BGP Inventory", "", "Route domain 0: BGP not enabled.", ""]
+
+        pre_neighbors = pre.get("neighbors", [])
+        post_neighbors = post.get("neighbors", [])
+        return [
+            "## BGP Inventory",
+            "",
+            "| Item | Pre-Upgrade | Post-Upgrade |",
+            "| :--- | ---: | ---: |",
+            f"| **Route domain 0 BGP enabled** | {pre.get('enabled', False)} | {post.get('enabled', False)} |",
+            f"| **Neighbor count** | {len(pre_neighbors)} | {len(post_neighbors)} |",
+            f"| **Neighbors** | {', '.join(f'`{n}`' for n in pre_neighbors) or 'None'} | "
+            f"{', '.join(f'`{n}`' for n in post_neighbors) or 'None'} |",
+            "",
+            "Full BGP running configuration, summaries, and advertised-route output "
+            "are retained in the pre/post snapshots.",
+            "",
+        ]
 
     @staticmethod
     def _health_markdown(title: str, health: Dict[str, Any]) -> List[str]:
