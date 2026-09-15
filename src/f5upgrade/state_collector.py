@@ -100,6 +100,16 @@ class StateCollector:
             print(output or "(no output)")
         print("-" * 75 + "\n")
 
+    def save_configuration_partitions(self) -> str:
+        """Persist all partition configuration before generating backups."""
+        output = self.run_tmsh("tmsh save sys config partitions all")
+        if output.startswith("ERROR running command:"):
+            raise RuntimeError(
+                "Could not save all partition configuration before backups: "
+                f"{output}"
+            )
+        return output
+
     def collect_all_state(self) -> Dict[str, Any]:
         """Collects structured state plus raw all-partition LTM evidence."""
         return {

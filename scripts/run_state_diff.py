@@ -52,6 +52,9 @@ def run_collection(
     print(f"[i] Summary: {vs_count} Virtual Servers, {pool_count} Pools, {node_count} Nodes.")
 
     if do_backup and phase == "pre":
+        print("\n[*] Saving all partition configuration before backups...")
+        collector.save_configuration_partitions()
+        print("[+] Configuration saved before backups.")
         print("\n[*] Creating verified UCS & SCF backups on BIG-IP...")
         print("    Naming format: $(echo $HOSTNAME | cut -d'.' -f1)-$(date +%H%M-%m%d%y)")
         backups = collector.create_backups()

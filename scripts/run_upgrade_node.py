@@ -633,6 +633,14 @@ def main() -> int:
         ),
     )
 
+    print("\n[*] Saving all partition configuration before backups...")
+    try:
+        save_output = collector.save_configuration_partitions()
+        print(f"[+] Configuration saved before backups: {save_output or 'PASS'}")
+    except RuntimeError as exc:
+        print(f"[-] {exc}")
+        return 2
+
     backups_ok = create_and_download_backups(
         client=client,
         settings=settings,

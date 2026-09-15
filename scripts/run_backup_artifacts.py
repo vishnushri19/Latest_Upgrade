@@ -495,6 +495,17 @@ def main() -> int:
     try:
         session.open()
 
+        save_config = session.run(
+            "tmsh save sys config partitions all",
+            timeout_sec=SSH_TIMEOUT,
+        )
+        if save_config.returncode != 0:
+            raise RuntimeError(
+                "Could not save all partition configuration before backups: "
+                f"{(save_config.stderr or save_config.stdout).strip()}"
+            )
+        print("[+] Configuration saved before backups.")
+
         hostname_result = session.run(
             "echo $HOSTNAME",
             timeout_sec=SSH_TIMEOUT,
