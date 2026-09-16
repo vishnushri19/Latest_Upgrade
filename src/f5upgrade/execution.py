@@ -421,8 +421,8 @@ def prepare_install_storage(
     print(image_listing or "(none)")
 
     image_names_response = client.run_bash(
-        "find /shared/images -maxdepth 1 -type f -name '*.iso' -printf '%f\\n' "
-        "| sort",
+        "ls -1 /shared/images/*.iso 2>/dev/null | "
+        "sed 's#^.*/##' | sort",
         timeout=60,
     )
     image_names = [
