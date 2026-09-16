@@ -10,6 +10,7 @@ from .checks import run_prechecks
 from .config import Settings
 from .execution import (
     check_image_present,
+    check_license_dates,
     exec_install_standby,
     exec_upload_files_standby,
     exec_reboot_to_volume_standby,
@@ -46,6 +47,7 @@ class UpgradeFlow:
         self._storage_result: Optional[CheckResult] = None
         self._upload_paths: List[str] = []
         self._combined_ehf = False
+        self._required_images_present = False
 
     def preflight(self) -> List[CheckResult]:
         """Run and cache all checks that must complete before backups."""
@@ -261,6 +263,7 @@ class UpgradeFlow:
             required_images_present = required_images_present and image.found
         if not expected_names:
             required_images_present = True
+        self._required_images_present = required_images_present
         self._storage_result = prepare_install_storage(
             self.client,
             self.settings.target_volume,
@@ -292,7 +295,11 @@ class UpgradeFlow:
         upload_paths = self._upload_paths
 
         # --- Execution: ensure image present on standby ---
-        if self.settings.auto_upload_iso and upload_paths:
+        if (
+            self.settings.auto_upload_iso
+            and upload_paths
+            and not self._required_images_present
+        ):
             upload_results = exec_upload_files_standby(
                 self.client,
                 host=self.settings.host,
@@ -302,6 +309,11 @@ class UpgradeFlow:
             results.extend(upload_results)
             if self.should_stop(results):
                 return results
+        elif self._required_images_present:
+            print(
+                "\nRequired upgrade image(s) already present in "
+                "/shared/images/. Skipping ISO upload."
+            )
 
         expected_names = [
             os.path.basename(path)
@@ -337,6 +349,19 @@ class UpgradeFlow:
             )
         )
         if not img.found or self.should_stop(results):
+            return results
+
+        license_image_name = (
+            os.path.basename(self.settings.base_iso_local_path)
+            if combined_ehf
+            else (img.matched_name or "")
+        )
+        license_result = check_license_dates(
+            self.client,
+            license_image_name,
+        )
+        results.append(license_result)
+        if self.should_stop(results):
             return results
 
         if not img.found or not self._confirm_install(

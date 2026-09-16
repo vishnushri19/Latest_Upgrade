@@ -8,7 +8,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import requests
 
@@ -90,6 +90,35 @@ def _is_fatal_tmsh_output(output: str) -> bool:
         marker in text
         for marker in fatal_markers
     )
+
+
+def _available_iso_names(client: BigIPClient) -> List[str]:
+    response = client.run_bash(
+        "ls -1 /shared/images/*.iso 2>/dev/null | "
+        "sed 's#^.*/##' | sort",
+        timeout=60,
+    )
+    return [
+        line.strip()
+        for line in _remote_command_output(response).splitlines()
+        if line.strip() and os.path.basename(line.strip()) == line.strip()
+    ]
+
+
+def _available_space_kib(client: BigIPClient) -> tuple[int, str]:
+    response = client.run_bash("df -Pk /shared/images", timeout=60)
+    output = _remote_command_output(response)
+    data_lines = [
+        line.split()
+        for line in output.splitlines()
+        if line.strip() and not line.lower().startswith("filesystem")
+    ]
+    if not data_lines or len(data_lines[-1]) < 5:
+        raise ValueError("Could not parse free space for /shared/images.")
+    try:
+        return int(data_lines[-1][3]), output
+    except ValueError as exc:
+        raise ValueError("Free-space value from df was not numeric.") from exc
 
 
 def _parse_volume_from_tmsh_status(
@@ -331,6 +360,7 @@ def check_image_present(
             },
         )
 
+
     filesystem_matches = [
         image
         for image in filesystem_images
@@ -368,6 +398,87 @@ def check_image_present(
             ),
         },
     )
+
+
+def check_license_dates(
+    client: BigIPClient,
+    image_name: str,
+) -> CheckResult:
+    """Validate the ISO license-check date against the device service date."""
+    result_id = "LIC-001"
+    result_name = "ISO and service-check dates validated"
+    remote_iso = f"/shared/images/{image_name}"
+
+    try:
+        version_response = client.run_bash(
+            "isoinfo -f -R -i "
+            f"{_shell_quote(remote_iso)} | grep -m1 'version_date'",
+            timeout=120,
+        )
+        version_path = next(
+            (
+                line.strip()
+                for line in _remote_command_output(version_response).splitlines()
+                if "version_date" in line
+            ),
+            "",
+        )
+        if not version_path:
+            raise ValueError("ISO version_date entry was not found.")
+
+        date_response = client.run_bash(
+            "isoinfo -R -i "
+            f"{_shell_quote(remote_iso)} -x {_shell_quote(version_path)}",
+            timeout=120,
+        )
+        iso_date = _extract_yyyymmdd(_remote_command_output(date_response))
+        if not iso_date:
+            raise ValueError("ISO license-check date was not found.")
+
+        service_response = client.run_bash(
+            "grep -F 'Service check date' /config/bigip.license",
+            timeout=60,
+        )
+        service_date = _extract_yyyymmdd(
+            _remote_command_output(service_response)
+        )
+        if not service_date:
+            raise ValueError("BIG-IP service-check date was not found.")
+
+        reactivation_required = service_date < iso_date
+        return CheckResult(
+            id=result_id,
+            category="License and Platform Readiness",
+            name=result_name,
+            status="FAIL" if reactivation_required else "PASS",
+            details={
+                "image": image_name,
+                "iso_license_check_date": iso_date,
+                "service_check_date": service_date,
+                "license_reactivation_required": reactivation_required,
+                "error": (
+                    "License reactivation is required before upgrade."
+                    if reactivation_required
+                    else ""
+                ),
+            },
+        )
+    except Exception as exc:
+        return CheckResult(
+            id=result_id,
+            category="License and Platform Readiness",
+            name=result_name,
+            status="FAIL",
+            details={
+                "image": image_name,
+                "error": f"{type(exc).__name__}: {exc}",
+            },
+        )
+
+
+def _extract_yyyymmdd(output: str) -> str:
+    match = re.search(r"(?<!\d)(20\d{6})(?!\d)", output or "")
+    return match.group(1) if match else ""
 
 
 def _is_hotfix_image(image_name: str) -> bool:
@@ -428,113 +539,122 @@ def prepare_install_storage(
         print("\nImages under /shared/images:")
         print(image_listing or "(none)")
 
-        image_names_response = client.run_bash(
-            "ls -1 /shared/images/*.iso 2>/dev/null | "
-            "sed 's#^.*/##' | sort",
-            timeout=60,
-        )
-        image_names = [
-            line.strip()
-            for line in _remote_command_output(image_names_response).splitlines()
-            if line.strip() and os.path.basename(line.strip()) == line.strip()
-        ]
-        if image_names:
-            print("\nNumbered ISO files:")
-            for index, name in enumerate(image_names, 1):
-                print(f"  {index}. {name}")
-            if sys.stdin.isatty():
+        if require_upload_space:
+            required_kib = 8 * 1024 * 1024
+            while True:
+                try:
+                    available_kib, df_output = _available_space_kib(client)
+                except ValueError as exc:
+                    return CheckResult(
+                        id=result_id,
+                        category="Execution Readiness",
+                        name=result_name,
+                        status="FAIL",
+                        details={**details, "error": str(exc)},
+                    )
+                details["disk_usage"] = df_output
+                available_gib = available_kib / (1024 * 1024)
+                print(
+                    f"\n/shared/images filesystem free space: {available_gib:.2f} GiB "
+                    "(minimum 8.00 GiB)"
+                )
+                if available_kib >= required_kib:
+                    break
+
+                image_names = _available_iso_names(client)
+                if not image_names:
+                    return CheckResult(
+                        id=result_id,
+                        category="Execution Readiness",
+                        name=result_name,
+                        status="FAIL",
+                        details={
+                            **details,
+                            "available_gib": round(available_gib, 2),
+                            "required_gib": 8,
+                            "error": (
+                                "Insufficient free space to upload the ISO "
+                                "and no ISO files remain for cleanup."
+                            ),
+                        },
+                    )
+
+                print("\nNumbered ISO files:")
+                for index, name in enumerate(image_names, 1):
+                    print(f"  {index}. {name}")
+                if not sys.stdin.isatty():
+                    return CheckResult(
+                        id=result_id,
+                        category="Execution Readiness",
+                        name=result_name,
+                        status="FAIL",
+                        details={
+                            **details,
+                            "available_gib": round(available_gib, 2),
+                            "required_gib": 8,
+                            "error": "ISO cleanup requires confirmation.",
+                        },
+                    )
+
                 answer = input(
-                    "Delete any ISO files? Enter numbers separated by commas, or press Enter to keep all: "
+                    "Free space is below 8 GiB. Delete ISO files? "
+                    "Enter numbers separated by commas: "
                 ).strip()
-                if answer:
-                    try:
-                        selected = sorted({int(item.strip()) for item in answer.split(",")})
-                        if any(index < 1 or index > len(image_names) for index in selected):
-                            raise IndexError
-                        selected_names = [image_names[index - 1] for index in selected]
-                    except (ValueError, IndexError):
+                try:
+                    selected = sorted(
+                        {int(item.strip()) for item in answer.split(",")}
+                    )
+                    if not selected or any(
+                        index < 1 or index > len(image_names)
+                        for index in selected
+                    ):
+                        raise IndexError
+                    selected_names = [image_names[index - 1] for index in selected]
+                except (ValueError, IndexError):
+                    return CheckResult(
+                        id=result_id,
+                        category="Execution Readiness",
+                        name=result_name,
+                        status="FAIL",
+                        details={**details, "error": "Invalid ISO deletion selection."},
+                    )
+
+                print("Selected ISO files:")
+                for name in selected_names:
+                    print(f"  - {name}")
+                confirm = input("Confirm deletion? (y/N): ").strip().lower()
+                if confirm not in ("y", "yes"):
+                    return CheckResult(
+                        id=result_id,
+                        category="Execution Readiness",
+                        name=result_name,
+                        status="FAIL",
+                        details={
+                            **details,
+                            "error": "ISO deletion was not confirmed while space was insufficient.",
+                        },
+                    )
+
+                for name in selected_names:
+                    delete_response = client.run_bash(
+                        f"rm -f -- {_shell_quote('/shared/images/' + name)}",
+                        timeout=60,
+                    )
+                    delete_output = _remote_command_output(delete_response)
+                    if _is_fatal_tmsh_output(delete_output):
                         return CheckResult(
                             id=result_id,
                             category="Execution Readiness",
                             name=result_name,
                             status="FAIL",
-                            details={**details, "error": "Invalid ISO deletion selection."},
+                            details={
+                                **details,
+                                "deleted_iso": name,
+                                "delete_output": delete_output,
+                                "error": f"Could not delete ISO file {name}.",
+                            },
                         )
-                    print("Selected ISO files:")
-                    for name in selected_names:
-                        print(f"  - {name}")
-                    confirm = input("Confirm deletion? (y/N): ").strip().lower()
-                    if confirm in ("y", "yes"):
-                        for name in selected_names:
-                            delete_response = client.run_bash(
-                                f"rm -f -- {_shell_quote('/shared/images/' + name)}",
-                                timeout=60,
-                            )
-                            delete_output = _remote_command_output(delete_response)
-                            if _is_fatal_tmsh_output(delete_output):
-                                return CheckResult(
-                                    id=result_id,
-                                    category="Execution Readiness",
-                                    name=result_name,
-                                    status="FAIL",
-                                    details={
-                                        **details,
-                                        "deleted_iso": name,
-                                        "delete_output": delete_output,
-                                        "error": f"Could not delete ISO file {name}.",
-                                    },
-                                )
-                        details["deleted_iso_files"] = selected_names
-
-    if require_upload_space:
-        response = client.run_bash(
-            "df -Pk /shared/images",
-            timeout=60,
-        )
-        df_output = _remote_command_output(response)
-        details["disk_usage"] = df_output
-        data_lines = [
-            line.split()
-            for line in df_output.splitlines()
-            if line.strip() and not line.lower().startswith("filesystem")
-        ]
-        if not data_lines or len(data_lines[-1]) < 5:
-            return CheckResult(
-                id=result_id,
-                category="Execution Readiness",
-                name=result_name,
-                status="FAIL",
-                details={**details, "error": "Could not parse free space for /shared/images."},
-            )
-        try:
-            available_kib = int(data_lines[-1][3])
-        except ValueError:
-            return CheckResult(
-                id=result_id,
-                category="Execution Readiness",
-                name=result_name,
-                status="FAIL",
-                details={**details, "error": "Free-space value from df was not numeric."},
-            )
-        required_kib = 8 * 1024 * 1024
-        available_gib = available_kib / (1024 * 1024)
-        print(
-            f"\n/shared/images filesystem free space after cleanup: {available_gib:.2f} GiB "
-            "(minimum 8.00 GiB)"
-        )
-        if available_kib < required_kib:
-            return CheckResult(
-                id=result_id,
-                category="Execution Readiness",
-                name=result_name,
-                status="FAIL",
-                details={
-                    **details,
-                    "available_gib": round(available_gib, 2),
-                    "required_gib": 8,
-                    "error": "Insufficient free space to upload the ISO after ISO cleanup.",
-                },
-            )
+                details.setdefault("deleted_iso_files", []).extend(selected_names)
 
     volume_response = client.run_bash(
         "tmsh show sys software",
