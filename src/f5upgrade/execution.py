@@ -411,56 +411,6 @@ def prepare_install_storage(
             details={"error": "Storage preparation requires a STANDBY device.", "role": role},
         )
 
-    if require_upload_space:
-        response = client.run_bash(
-            "df -Pk /shared/images",
-            timeout=60,
-        )
-        df_output = _remote_command_output(response)
-        details["disk_usage"] = df_output
-        data_lines = [
-            line.split()
-            for line in df_output.splitlines()
-            if line.strip() and not line.lower().startswith("filesystem")
-        ]
-        if not data_lines or len(data_lines[-1]) < 5:
-            return CheckResult(
-                id=result_id,
-                category="Execution Readiness",
-                name=result_name,
-                status="FAIL",
-                details={**details, "error": "Could not parse free space for /shared/images."},
-            )
-        try:
-            available_kib = int(data_lines[-1][3])
-        except ValueError:
-            return CheckResult(
-                id=result_id,
-                category="Execution Readiness",
-                name=result_name,
-                status="FAIL",
-                details={**details, "error": "Free-space value from df was not numeric."},
-            )
-        required_kib = 8 * 1024 * 1024
-        available_gib = available_kib / (1024 * 1024)
-        print(
-            f"\n/shared/images filesystem free space: {available_gib:.2f} GiB "
-            "(minimum 8.00 GiB)"
-        )
-        if available_kib < required_kib:
-            return CheckResult(
-                id=result_id,
-                category="Execution Readiness",
-                name=result_name,
-                status="FAIL",
-                details={
-                    **details,
-                    "available_gib": round(available_gib, 2),
-                    "required_gib": 8,
-                    "error": "Insufficient free space to upload the ISO.",
-                },
-            )
-
     image_response = client.run_bash(
         "ls -lh /shared/images/ 2>/dev/null | head -n 500",
         timeout=60,
@@ -508,10 +458,75 @@ def prepare_install_storage(
                 confirm = input("Confirm deletion? (y/N): ").strip().lower()
                 if confirm in ("y", "yes"):
                     for name in selected_names:
-                        client.run_bash(
+                        delete_response = client.run_bash(
                             f"rm -f -- {_shell_quote('/shared/images/' + name)}",
                             timeout=60,
                         )
+                        delete_output = _remote_command_output(delete_response)
+                        if _is_fatal_tmsh_output(delete_output):
+                            return CheckResult(
+                                id=result_id,
+                                category="Execution Readiness",
+                                name=result_name,
+                                status="FAIL",
+                                details={
+                                    **details,
+                                    "deleted_iso": name,
+                                    "delete_output": delete_output,
+                                    "error": f"Could not delete ISO file {name}.",
+                                },
+                            )
+                    details["deleted_iso_files"] = selected_names
+
+    if require_upload_space:
+        response = client.run_bash(
+            "df -Pk /shared/images",
+            timeout=60,
+        )
+        df_output = _remote_command_output(response)
+        details["disk_usage"] = df_output
+        data_lines = [
+            line.split()
+            for line in df_output.splitlines()
+            if line.strip() and not line.lower().startswith("filesystem")
+        ]
+        if not data_lines or len(data_lines[-1]) < 5:
+            return CheckResult(
+                id=result_id,
+                category="Execution Readiness",
+                name=result_name,
+                status="FAIL",
+                details={**details, "error": "Could not parse free space for /shared/images."},
+            )
+        try:
+            available_kib = int(data_lines[-1][3])
+        except ValueError:
+            return CheckResult(
+                id=result_id,
+                category="Execution Readiness",
+                name=result_name,
+                status="FAIL",
+                details={**details, "error": "Free-space value from df was not numeric."},
+            )
+        required_kib = 8 * 1024 * 1024
+        available_gib = available_kib / (1024 * 1024)
+        print(
+            f"\n/shared/images filesystem free space after cleanup: {available_gib:.2f} GiB "
+            "(minimum 8.00 GiB)"
+        )
+        if available_kib < required_kib:
+            return CheckResult(
+                id=result_id,
+                category="Execution Readiness",
+                name=result_name,
+                status="FAIL",
+                details={
+                    **details,
+                    "available_gib": round(available_gib, 2),
+                    "required_gib": 8,
+                    "error": "Insufficient free space to upload the ISO after ISO cleanup.",
+                },
+            )
 
     volume_response = client.run_bash(
         "tmsh show sys software",

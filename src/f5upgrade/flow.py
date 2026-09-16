@@ -42,8 +42,16 @@ class UpgradeFlow:
         if settings is None:
             raise ValueError("Settings is required")
         self.settings = settings
+        self._preflight_results: Optional[List[CheckResult]] = None
+        self._storage_result: Optional[CheckResult] = None
+        self._upload_paths: List[str] = []
+        self._combined_ehf = False
 
-    def run(self) -> List[CheckResult]:
+    def preflight(self) -> List[CheckResult]:
+        """Run and cache all checks that must complete before backups."""
+        if self._preflight_results is not None:
+            return list(self._preflight_results)
+
         results: List[CheckResult] = []
 
         # --- Version + role discovery (for idempotence and safety) ---
@@ -62,7 +70,8 @@ class UpgradeFlow:
                 )
             )
             if self.should_stop(results):
-                return results
+                self._preflight_results = results
+                return list(results)
 
         try:
             role = (get_failover_role(self.client) or "").lower()
@@ -78,7 +87,8 @@ class UpgradeFlow:
                 )
             )
             if self.should_stop(results):
-                return results
+                self._preflight_results = results
+                return list(results)
 
         target = (self.settings.target_image_contains or "").strip()
 
@@ -99,7 +109,8 @@ class UpgradeFlow:
                     },
                 )
             )
-            return results
+            self._preflight_results = results
+            return list(results)
 
         # 2) If ACTIVE, do not run upgrade steps (but still run prechecks)
         if role == "active":
@@ -108,7 +119,8 @@ class UpgradeFlow:
             precheck_results = run_prechecks(self.client)
             results.extend(precheck_results)
             if self.should_stop(results):
-                return results
+                self._preflight_results = results
+                return list(results)
 
             print("\n" + "=" * 75)
             print("🔒 [SAFETY BLAST-RADIUS LOCK ACTIVATED]")
@@ -138,7 +150,8 @@ class UpgradeFlow:
                     },
                 )
             )
-            return results
+            self._preflight_results = results
+            return list(results)
 
         # From here on, we assume role is STANDBY (or unknown but not 'active')
         print(f"\n" + "=" * 75)
@@ -149,7 +162,8 @@ class UpgradeFlow:
         precheck_results = run_prechecks(self.client)
         results.extend(precheck_results)
         if self.should_stop(results):
-            return results
+            self._preflight_results = results
+            return list(results)
 
         results.append(
             CheckResult(
@@ -161,7 +175,8 @@ class UpgradeFlow:
             )
         )
         if self.should_stop(results):
-            return results
+            self._preflight_results = results
+            return list(results)
 
         # --- Discovery (unchanged) ---
         try:
@@ -191,7 +206,8 @@ class UpgradeFlow:
                     details={"error": str(e)},
                 )
             )
-            return results
+            self._preflight_results = results
+            return list(results)
 
         try:
             from .mgmt import resolve_management_addresses
@@ -219,14 +235,15 @@ class UpgradeFlow:
                     details={"error": str(e)},
                 )
             )
-            return results
+            self._preflight_results = results
+            return list(results)
 
-        # --- Execution: prepare storage before image upload/install ---
-        combined_ehf = bool(
+        # --- Storage and target-volume safety ---
+        self._combined_ehf = bool(
             self.settings.base_iso_local_path
             and self.settings.hotfix_iso_local_path
         )
-        upload_paths = [
+        self._upload_paths = [
             path
             for path in (
                 self.settings.base_iso_local_path,
@@ -234,15 +251,30 @@ class UpgradeFlow:
             )
             if path
         ] or ([self.settings.iso_local_path] if self.settings.iso_local_path else [])
-        storage_result = prepare_install_storage(
+        self._storage_result = prepare_install_storage(
             self.client,
             self.settings.target_volume,
-            require_upload_space=self.settings.auto_upload_iso and bool(upload_paths),
+            require_upload_space=self.settings.auto_upload_iso and bool(self._upload_paths),
             expected_image_contains=self.settings.target_image_contains,
         )
-        results.append(storage_result)
+        results.append(self._storage_result)
+        self._preflight_results = results
+        return list(results)
+
+    def run(self) -> List[CheckResult]:
+        results = self.preflight()
         if self.should_stop(results):
             return results
+
+        if any(result.id == "FLOW-SKIP-001" for result in results):
+            return results
+
+        storage_result = self._storage_result
+        if storage_result is None:
+            return results
+
+        combined_ehf = self._combined_ehf
+        upload_paths = self._upload_paths
 
         # --- Execution: ensure image present on standby ---
         if self.settings.auto_upload_iso and upload_paths:

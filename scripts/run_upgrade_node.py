@@ -570,6 +570,44 @@ def main() -> int:
     print(f"  Target Volume: {settings.target_volume}")
     print("=" * 80)
 
+    flow = UpgradeFlow(
+        client=client,
+        options=FlowOptions(
+            allow_risk_accepted=True,
+            fail_fast=True,
+            require_standby=True,
+        ),
+        settings=settings,
+    )
+
+    print(
+        "\n[PREFLIGHT] Validating standby role, configuration, discovery, "
+        "storage, and target-volume readiness..."
+    )
+    preflight_results = flow.preflight()
+    if flow.should_stop(preflight_results):
+        report = to_report(
+            preflight_results,
+            meta={
+                "bigip_host": settings.host,
+                "mode": "preflight",
+            },
+        )
+        flow_json = output_dir / f"upgrade_flow_report_{safe_host}.json"
+        flow_md = output_dir / f"upgrade_flow_report_{safe_host}.md"
+        write_json(str(flow_json), report)
+        write_markdown(str(flow_md), report)
+        print(
+            "\n[-] Upgrade preflight did not pass. "
+            f"Overall status: {report['overall_status']}"
+        )
+        print(f"[-] See report details at: {flow_md}")
+        print(
+            "[-] Halting workflow before pre-upgrade snapshots, "
+            "auto-sync changes, or backups.\n"
+        )
+        return 2
+
     # -------------------------------------------------------------------------
     # STAGE 1: PRE-UPGRADE STATE COLLECTION AND BACKUPS
     # -------------------------------------------------------------------------
@@ -656,20 +694,10 @@ def main() -> int:
     # -------------------------------------------------------------------------
     print(
         "\n[STAGE 2/4] Executing Upgrade Flow "
-        "& Prechecks..."
+        "(Upload, Install, and Reboot)..."
     )
 
     StateCollector(client).display_ltm_health_summary()
-
-    flow = UpgradeFlow(
-        client=client,
-        options=FlowOptions(
-            allow_risk_accepted=True,
-            fail_fast=True,
-            require_standby=True,
-        ),
-        settings=settings,
-    )
 
     results = flow.run()
 
