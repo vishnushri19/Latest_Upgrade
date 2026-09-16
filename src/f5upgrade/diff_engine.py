@@ -276,84 +276,168 @@ class DiffEngine:
         counts = diff_result.get("counts", {})
         crit = summary.get("critical_regressions", 0)
         warn = summary.get("warnings", 0)
-        status = diff_result.get("overall_status", "UNKNOWN")
-
-        badge = "🔴 **FAIL**" if status == "FAIL" else "🟢 **PASS**"
+        health = diff_result.get("health_summary", {})
+        pre_health = health.get("pre", {})
+        post_health = health.get("post", {})
+        all_diffs = self._all_diffs(diff_result)
+        object_critical = [
+            d for d in all_diffs
+            if d.get("severity") == "CRITICAL"
+            and d.get("category") != "sync_status"
+        ]
+        sync_diffs = diff_result.get("sync_status", [])
+        review_only = bool(sync_diffs) and not object_critical
+        if object_critical:
+            result = "FAIL"
+            badge = "🔴 **FAIL**"
+        elif review_only:
+            result = "REVIEW"
+            badge = "🟡 **REVIEW REQUIRED**"
+        else:
+            result = "PASS"
+            badge = "🟢 **PASS**"
 
         lines = [
-            f"# Pre vs Post Upgrade Difference Report",
-            f"",
+            "# Pre vs Post Upgrade Difference Report",
+            "",
             f"- **Host:** `{host}`",
             f"- **Generated:** `{diff_result.get('generated_at')}`",
             f"- **Overall Result:** {badge}",
-            f"- **Critical Regressions:** {crit}",
-            f"- **Warnings / Changes:** {warn}",
-            f"",
-            f"## Inventory Counts",
-            f"| Object Type | Pre-Upgrade Count | Post-Upgrade Count |",
-            f"| :--- | :--- | :--- |",
-            f"| **Virtual Servers** | {counts.get('pre_vs_count', 0)} | {counts.get('post_vs_count', 0)} |",
-            f"| **Pools** | {counts.get('pre_pool_count', 0)} | {counts.get('post_pool_count', 0)} |",
-            f"| **Nodes** | {counts.get('pre_node_count', 0)} | {counts.get('post_node_count', 0)} |",
-            f"",
+            "",
+            "## Executive Summary",
+            "",
+            "| Area | Pre-Upgrade | Post-Upgrade | Result |",
+            "| :--- | :--- | :--- | :--- |",
+            f"| Software version | Not captured | Not captured | REVIEW |",
+            f"| Device role | Not captured | Not captured | REVIEW |",
+            f"| Virtual servers | {counts.get('pre_vs_count', 0)} | {counts.get('post_vs_count', 0)} | {self._count_result(counts.get('pre_vs_count'), counts.get('post_vs_count'))} |",
+            f"| Pools | {counts.get('pre_pool_count', 0)} | {counts.get('post_pool_count', 0)} | {self._count_result(counts.get('pre_pool_count'), counts.get('post_pool_count'))} |",
+            f"| Nodes | {counts.get('pre_node_count', 0)} | {counts.get('post_node_count', 0)} | {self._count_result(counts.get('pre_node_count'), counts.get('post_node_count'))} |",
+            f"| ConfigSync | {self._sync_state(diff_result, 'pre')} | {self._sync_state(diff_result, 'post')} | {'REVIEW' if sync_diffs else 'PASS'} |",
+            f"| Application health | {self._health_result(pre_health)} | {self._health_result(post_health)} | {'FAIL' if object_critical else 'PASS'} |",
+            "",
+            f"**Software upgrade:** PASS if installation and reboot validation completed outside this diff.",
+            f"**Post-upgrade validation:** {result}.",
+            "",
+            "## Health Summary",
+            "",
+            "| Object type | Available before | Available after | Offline before | Offline after | Unknown before | Unknown after |",
+            "| :--- | ---: | ---: | ---: | ---: | ---: | ---: |",
+        ]
+        for label, key in (
+            ("Virtual servers", "virtual_servers"),
+            ("Pools", "pools"),
+            ("Nodes", "nodes"),
+        ):
+            before = pre_health.get(key, {})
+            after = post_health.get(key, {})
+            lines.append(
+                f"| {label} | {self._availability_count(before, 'available')} | "
+                f"{self._availability_count(after, 'available')} | "
+                f"{self._availability_count(before, 'offline')} | "
+                f"{self._availability_count(after, 'offline')} | "
+                f"{self._availability_count(before, 'unknown')} | "
+                f"{self._availability_count(after, 'unknown')} |"
+            )
+        lines.extend([
+            "",
+            "## Configuration and Routing Summary",
+            "",
+            "| Check | Before | After | Result |",
+            "| :--- | :--- | :--- | :--- |",
+            f"| Interfaces up | {self._interface_state(pre_health)} | {self._interface_state(post_health)} | {'PASS' if self._interface_state(pre_health) == self._interface_state(post_health) else 'REVIEW'} |",
+            f"| BGP route domain 0 | {self._bgp_state(diff_result, 'pre')} | {self._bgp_state(diff_result, 'post')} | {self._comparison_result(self._bgp_state(diff_result, 'pre'), self._bgp_state(diff_result, 'post'))} |",
+            f"| BGP neighbors | {self._bgp_neighbors(diff_result, 'pre')} | {self._bgp_neighbors(diff_result, 'post')} | {self._comparison_result(self._bgp_neighbors(diff_result, 'pre'), self._bgp_neighbors(diff_result, 'post'))} |",
+            "",
+            "## Differences Requiring Action",
+        ])
+        if object_critical:
+            lines.extend(self._diff_table("🔴 Critical regressions", object_critical))
+        elif sync_diffs:
+            lines.extend(self._diff_table("🟡 ConfigSync review", sync_diffs))
+            lines.append("- ConfigSync differences are shown as review items during rolling or version-mismatched HA upgrades.")
+        else:
+            lines.append("No differences detected.")
+        lines.extend([
+            "",
+            "## Raw Evidence",
+            "",
+            "- Full pre/post snapshots remain in the CRQ `snapshots/` directory.",
+            "- Full machine-readable diff data remains in the JSON diff report.",
+            "",
+            "## Notes",
+            "",
+            "- This report summarizes pre/post state; it does not replace the raw evidence.",
+            "- ConfigSync may require review while HA peers run different software versions.",
+            "",
+        ])
+        return "\n".join(lines)
+
+    @staticmethod
+    def _all_diffs(diff_result: Dict[str, Any]) -> List[Dict[str, Any]]:
+        return [
+            item
+            for category in (
+                "virtual_servers", "pools", "nodes", "sync_status",
+                "tmm_routes", "mgmt_routes", "interfaces",
+            )
+            for item in diff_result.get(category, [])
         ]
 
-        health = diff_result.get("health_summary", {})
-        lines.extend(self._health_markdown("Pre-Upgrade Health", health.get("pre", {})))
-        lines.extend(self._health_markdown("Post-Upgrade Health", health.get("post", {})))
-        lines.extend(
-            self._crypto_markdown(
-                diff_result.get("crypto_inventory", {}).get("pre", {}),
-                diff_result.get("crypto_inventory", {}).get("post", {}),
+    @staticmethod
+    def _count_result(pre: Any, post: Any) -> str:
+        return "PASS" if pre == post else "REVIEW"
+
+    @staticmethod
+    def _availability_count(summary: Dict[str, Any], state: str) -> int:
+        return int(summary.get("availability", {}).get(state, 0))
+
+    @staticmethod
+    def _health_result(summary: Dict[str, Any]) -> str:
+        return "Stable" if summary else "Not captured"
+
+    @staticmethod
+    def _interface_state(summary: Dict[str, Any]) -> str:
+        interfaces = summary.get("interfaces", {})
+        return f"{interfaces.get('up_count', 0)}/{interfaces.get('total', 0)} up"
+
+    @staticmethod
+    def _sync_state(diff_result: Dict[str, Any], side: str) -> str:
+        diffs = diff_result.get("sync_status", [])
+        if not diffs:
+            return "In Sync"
+        return str(diffs[0].get(f"{side}_state", "Unknown"))
+
+    @staticmethod
+    def _bgp_state(diff_result: Dict[str, Any], side: str) -> str:
+        inventory = diff_result.get("bgp_inventory", {}).get(side, {})
+        return "Enabled" if inventory.get("enabled") else "Disabled"
+
+    @staticmethod
+    def _bgp_neighbors(diff_result: Dict[str, Any], side: str) -> int:
+        return len(diff_result.get("bgp_inventory", {}).get(side, {}).get("neighbors", []))
+
+    @staticmethod
+    def _comparison_result(pre: Any, post: Any) -> str:
+        return "PASS" if pre == post else "REVIEW"
+
+    @staticmethod
+    def _diff_table(title: str, diffs: List[Dict[str, Any]]) -> List[str]:
+        lines = [
+            "",
+            f"### {title}",
+            "",
+            "| Category | Object | Before | After | Severity | Action |",
+            "| :--- | :--- | :--- | :--- | :--- | :--- |",
+        ]
+        for diff in diffs:
+            action = "Review ConfigSync after peer upgrade" if diff.get("category") == "sync_status" else "Investigate before release"
+            lines.append(
+                f"| {diff.get('category', '').upper()} | `{diff.get('name', '')}` | "
+                f"`{diff.get('pre_state', '')}` | `{diff.get('post_state', '')}` | "
+                f"{diff.get('severity', '')} | {action} |"
             )
-        )
-        lines.extend(
-            self._bgp_markdown(
-                diff_result.get("bgp_inventory", {}).get("pre", {}),
-                diff_result.get("bgp_inventory", {}).get("post", {}),
-            )
-        )
-
-        # Critical Section
-        all_diffs = (
-            diff_result.get("virtual_servers", [])
-            + diff_result.get("pools", [])
-            + diff_result.get("nodes", [])
-            + diff_result.get("sync_status", [])
-            + diff_result.get("tmm_routes", [])
-            + diff_result.get("mgmt_routes", [])
-            + diff_result.get("interfaces", [])
-        )
-
-        crit_diffs = [d for d in all_diffs if d.get("severity") == "CRITICAL"]
-        warn_diffs = [d for d in all_diffs if d.get("severity") == "WARNING"]
-
-        if crit_diffs:
-            lines.append("## 🔴 Critical Regressions Detected")
-            lines.append("| Category | Object Name | Pre State | Post State | Details |")
-            lines.append("| :--- | :--- | :--- | :--- | :--- |")
-            for d in crit_diffs:
-                lines.append(f"| **{d.get('category', '').upper()}** | `{d.get('name')}` | `{d.get('pre_state')}` | `{d.get('post_state')}` | {d.get('details')} |")
-            lines.append("")
-        else:
-            lines.append("## 🟢 No Critical Regressions Detected")
-            lines.append("- All pre-existing virtual servers, active pool members, and nodes maintained healthy state.")
-            lines.append("")
-
-        if warn_diffs:
-            lines.append("## 🟡 Warnings & Status Variations")
-            lines.append("| Category | Object Name | Pre State | Post State | Details |")
-            lines.append("| :--- | :--- | :--- | :--- | :--- |")
-            for d in warn_diffs:
-                lines.append(f"| **{d.get('category', '').upper()}** | `{d.get('name')}` | `{d.get('pre_state')}` | `{d.get('post_state')}` | {d.get('details')} |")
-            lines.append("")
-
-        lines.append("## Notes")
-        lines.append("- This report is generated automatically by comparing pre-upgrade and post-upgrade iControl REST snapshots.")
-        lines.append("- Recheck any offline virtual servers or missing routes before releasing traffic.")
-        lines.append("")
-
-        return "\n".join(lines)
+        return lines
 
     @staticmethod
     def _crypto_markdown(
