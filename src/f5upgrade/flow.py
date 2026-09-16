@@ -251,11 +251,26 @@ class UpgradeFlow:
             )
             if path
         ] or ([self.settings.iso_local_path] if self.settings.iso_local_path else [])
+        expected_names = [
+            os.path.basename(path)
+            for path in self._upload_paths
+        ]
+        required_images_present = bool(expected_names)
+        for image_name in expected_names:
+            image = check_image_present(self.client, image_name)
+            required_images_present = required_images_present and image.found
+        if not expected_names:
+            required_images_present = True
         self._storage_result = prepare_install_storage(
             self.client,
             self.settings.target_volume,
-            require_upload_space=self.settings.auto_upload_iso and bool(self._upload_paths),
+            require_upload_space=(
+                self.settings.auto_upload_iso
+                and bool(self._upload_paths)
+                and not required_images_present
+            ),
             expected_image_contains=self.settings.target_image_contains,
+            skip_iso_cleanup=required_images_present,
         )
         results.append(self._storage_result)
         self._preflight_results = results

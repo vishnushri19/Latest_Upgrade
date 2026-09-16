@@ -380,6 +380,7 @@ def prepare_install_storage(
     *,
     require_upload_space: bool,
     expected_image_contains: str = "",
+    skip_iso_cleanup: bool = False,
 ) -> CheckResult:
     """
     Display storage state and safely prepare an inactive target volume.
@@ -411,72 +412,79 @@ def prepare_install_storage(
             details={"error": "Storage preparation requires a STANDBY device.", "role": role},
         )
 
-    image_response = client.run_bash(
-        "ls -lh /shared/images/ 2>/dev/null | head -n 500",
-        timeout=60,
-    )
-    image_listing = _remote_command_output(image_response)
-    details["image_listing"] = image_listing
-    print("\nImages under /shared/images:")
-    print(image_listing or "(none)")
+    if skip_iso_cleanup:
+        print(
+            "\nRequested upgrade image is already present in /shared/images/. "
+            "Skipping ISO cleanup and upload-space validation."
+        )
+        details["skipped_iso_cleanup"] = True
+    else:
+        image_response = client.run_bash(
+            "ls -lh /shared/images/ 2>/dev/null | head -n 500",
+            timeout=60,
+        )
+        image_listing = _remote_command_output(image_response)
+        details["image_listing"] = image_listing
+        print("\nImages under /shared/images:")
+        print(image_listing or "(none)")
 
-    image_names_response = client.run_bash(
-        "ls -1 /shared/images/*.iso 2>/dev/null | "
-        "sed 's#^.*/##' | sort",
-        timeout=60,
-    )
-    image_names = [
-        line.strip()
-        for line in _remote_command_output(image_names_response).splitlines()
-        if line.strip() and os.path.basename(line.strip()) == line.strip()
-    ]
-    if image_names:
-        print("\nNumbered ISO files:")
-        for index, name in enumerate(image_names, 1):
-            print(f"  {index}. {name}")
-        if sys.stdin.isatty():
-            answer = input(
-                "Delete any ISO files? Enter numbers separated by commas, or press Enter to keep all: "
-            ).strip()
-            if answer:
-                try:
-                    selected = sorted({int(item.strip()) for item in answer.split(",")})
-                    if any(index < 1 or index > len(image_names) for index in selected):
-                        raise IndexError
-                    selected_names = [image_names[index - 1] for index in selected]
-                except (ValueError, IndexError):
-                    return CheckResult(
-                        id=result_id,
-                        category="Execution Readiness",
-                        name=result_name,
-                        status="FAIL",
-                        details={**details, "error": "Invalid ISO deletion selection."},
-                    )
-                print("Selected ISO files:")
-                for name in selected_names:
-                    print(f"  - {name}")
-                confirm = input("Confirm deletion? (y/N): ").strip().lower()
-                if confirm in ("y", "yes"):
-                    for name in selected_names:
-                        delete_response = client.run_bash(
-                            f"rm -f -- {_shell_quote('/shared/images/' + name)}",
-                            timeout=60,
+        image_names_response = client.run_bash(
+            "ls -1 /shared/images/*.iso 2>/dev/null | "
+            "sed 's#^.*/##' | sort",
+            timeout=60,
+        )
+        image_names = [
+            line.strip()
+            for line in _remote_command_output(image_names_response).splitlines()
+            if line.strip() and os.path.basename(line.strip()) == line.strip()
+        ]
+        if image_names:
+            print("\nNumbered ISO files:")
+            for index, name in enumerate(image_names, 1):
+                print(f"  {index}. {name}")
+            if sys.stdin.isatty():
+                answer = input(
+                    "Delete any ISO files? Enter numbers separated by commas, or press Enter to keep all: "
+                ).strip()
+                if answer:
+                    try:
+                        selected = sorted({int(item.strip()) for item in answer.split(",")})
+                        if any(index < 1 or index > len(image_names) for index in selected):
+                            raise IndexError
+                        selected_names = [image_names[index - 1] for index in selected]
+                    except (ValueError, IndexError):
+                        return CheckResult(
+                            id=result_id,
+                            category="Execution Readiness",
+                            name=result_name,
+                            status="FAIL",
+                            details={**details, "error": "Invalid ISO deletion selection."},
                         )
-                        delete_output = _remote_command_output(delete_response)
-                        if _is_fatal_tmsh_output(delete_output):
-                            return CheckResult(
-                                id=result_id,
-                                category="Execution Readiness",
-                                name=result_name,
-                                status="FAIL",
-                                details={
-                                    **details,
-                                    "deleted_iso": name,
-                                    "delete_output": delete_output,
-                                    "error": f"Could not delete ISO file {name}.",
-                                },
+                    print("Selected ISO files:")
+                    for name in selected_names:
+                        print(f"  - {name}")
+                    confirm = input("Confirm deletion? (y/N): ").strip().lower()
+                    if confirm in ("y", "yes"):
+                        for name in selected_names:
+                            delete_response = client.run_bash(
+                                f"rm -f -- {_shell_quote('/shared/images/' + name)}",
+                                timeout=60,
                             )
-                    details["deleted_iso_files"] = selected_names
+                            delete_output = _remote_command_output(delete_response)
+                            if _is_fatal_tmsh_output(delete_output):
+                                return CheckResult(
+                                    id=result_id,
+                                    category="Execution Readiness",
+                                    name=result_name,
+                                    status="FAIL",
+                                    details={
+                                        **details,
+                                        "deleted_iso": name,
+                                        "delete_output": delete_output,
+                                        "error": f"Could not delete ISO file {name}.",
+                                    },
+                                )
+                        details["deleted_iso_files"] = selected_names
 
     if require_upload_space:
         response = client.run_bash(
