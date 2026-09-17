@@ -13,17 +13,13 @@ AUTO_SYNC_EXCLUDED_GROUPS = frozenset({"device_trust_group"})
 
 def get_failover_role(client: BigIPClient) -> Optional[str]:
     """
-    Best-effort extraction of local failover role from /mgmt/tm/cm/failover-status.
+    Robust extraction of local failover role.
+    Tries /mgmt/tm/cm/failover-status first, then falls back to tmsh bash query
+    if the REST endpoint is slow/unresponsive.
 
     Returns:
       "active" | "standby" | None
-
-    Notes:
-      - BIG-IP payload shape varies by version/build.
-      - We try multiple common patterns safely by scanning all string fields.
     """
-    payload = client.failover_state()
-
     def _search(obj: Any) -> Optional[str]:
         if obj is None:
             return None
@@ -52,7 +48,42 @@ def get_failover_role(client: BigIPClient) -> Optional[str]:
 
         return None
 
-    return _search(payload)
+    # 1. Try iControl REST with 15s timeout
+    try:
+        payload = client.failover_state()
+        role = _search(payload)
+        if role:
+            return role
+    except Exception:
+        pass
+
+    # 2. Fast Fallback via tmsh / bash (never hangs)
+    try:
+        resp = client.run_bash("tmsh -q show cm failover-status 2>/dev/null", timeout=15)
+        out = str(resp.get("commandResult", "")).lower()
+        if "status   active" in out or "status  active" in out or "1/1 active" in out:
+            return "active"
+        if "status   standby" in out or "status  standby" in out or "1/1 standby" in out:
+            return "standby"
+        if "active" in out:
+            return "active"
+        if "standby" in out:
+            return "standby"
+    except Exception:
+        pass
+
+    # 3. Fallback to /var/prompt/ps1
+    try:
+        resp = client.run_bash("cat /var/prompt/ps1 2>/dev/null || true", timeout=10)
+        out = str(resp.get("commandResult", "")).lower()
+        if "active" in out:
+            return "active"
+        if "standby" in out:
+            return "standby"
+    except Exception:
+        pass
+
+    return None
 
 
 def _device_group_auto_sync_states(
