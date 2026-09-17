@@ -15,6 +15,11 @@ from f5upgrade.config import load_settings
 SSH_TIMEOUT = 30
 BACKUP_TIMEOUT = 1800
 COPY_TIMEOUT = 1800
+# Pause after each completed backup stage (UCS/SCF/QKView/ASMQKView) to let
+# the device settle before starting the next backup task.
+BACKUP_STAGE_WAIT_SECONDS = int(
+    os.environ.get("BACKUP_STAGE_WAIT_SECONDS", "60")
+)
 
 
 def _safe_host(host: str) -> str:
@@ -594,7 +599,7 @@ def main() -> int:
         all_remote_files: List[str] = []
         has_backup_failures = False
 
-        for name, command in commands:
+        for index, (name, command) in enumerate(commands):
             result = _run_backup_task(
                 session=session,
                 name=name,
@@ -610,6 +615,15 @@ def main() -> int:
             all_remote_files.extend(
                 result.get("remote_files", [])
             )
+
+            is_last_stage = index == len(commands) - 1
+            if not is_last_stage and BACKUP_STAGE_WAIT_SECONDS > 0:
+                print(
+                    f"[*] {name} complete. Waiting "
+                    f"{BACKUP_STAGE_WAIT_SECONDS}s before starting "
+                    f"the next backup stage..."
+                )
+                time.sleep(BACKUP_STAGE_WAIT_SECONDS)
 
         all_remote_files = list(
             dict.fromkeys(all_remote_files)

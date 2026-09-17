@@ -100,6 +100,10 @@ make install
 - export BASE_ISO_LOCAL_PATH="/path/to/BIGIP-16.1.4.1.iso"
 - export HOTFIX_ISO_LOCAL_PATH="/path/to/Hotfix-BIGIP-16.1.4.1.0.50.5-ENG.iso"
 - export SCP_USER="admin"  
+- export BACKUP_STAGE_WAIT_SECONDS="60"  # pause between UCS/SCF/QKView/ASMQKView stages (default 60)
+- export LICENSE_DATE_TIMEOUT_SECONDS="180"  # per-command timeout for LIC-001 date checks (default 180)
+- export LICENSE_DATE_MAX_RETRIES="3"        # retry attempts for transient LIC-001 timeouts (default 3)
+- export LICENSE_DATE_RETRY_DELAY_SECONDS="10"  # delay between LIC-001 retries (default 10)
 
 ### Run Prechecks
 Writes reports to outputs/<CRQ_NUMBER>/ in both JSON and Markdown.

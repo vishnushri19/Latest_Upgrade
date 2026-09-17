@@ -23,6 +23,11 @@ from run_backup_artifacts import SSHSession, _run_backup_task
 BACKUP_TIMEOUT = 1800
 COPY_TIMEOUT = 1800
 SSH_TIMEOUT = 60
+# Pause after each completed backup stage (UCS/SCF/QKView/ASMQKView) to let
+# the device settle before starting the next backup task.
+BACKUP_STAGE_WAIT_SECONDS = int(
+    os.environ.get("BACKUP_STAGE_WAIT_SECONDS", "60")
+)
 
 
 def _safe_host(host: str) -> str:
@@ -403,7 +408,7 @@ def create_and_download_backups(
 
         remote_files: List[str] = []
 
-        for name, command in backup_commands:
+        for index, (name, command) in enumerate(backup_commands):
             result = _run_backup_task(
                 session=session,
                 name=name,
@@ -417,6 +422,15 @@ def create_and_download_backups(
             ):
                 if path not in remote_files:
                     remote_files.append(path)
+
+            is_last_stage = index == len(backup_commands) - 1
+            if not is_last_stage and BACKUP_STAGE_WAIT_SECONDS > 0:
+                print(
+                    f"[*] {name} complete. Waiting "
+                    f"{BACKUP_STAGE_WAIT_SECONDS}s before starting "
+                    f"the next backup stage..."
+                )
+                time.sleep(BACKUP_STAGE_WAIT_SECONDS)
 
         verified_files: List[str] = []
 

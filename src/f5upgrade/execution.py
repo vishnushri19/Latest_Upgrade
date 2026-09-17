@@ -400,6 +400,45 @@ def check_image_present(
     )
 
 
+LICENSE_DATE_TIMEOUT_SECONDS = int(
+    os.environ.get("LICENSE_DATE_TIMEOUT_SECONDS", "180")
+)
+LICENSE_DATE_MAX_RETRIES = int(
+    os.environ.get("LICENSE_DATE_MAX_RETRIES", "3")
+)
+LICENSE_DATE_RETRY_DELAY_SECONDS = int(
+    os.environ.get("LICENSE_DATE_RETRY_DELAY_SECONDS", "10")
+)
+
+
+def _run_bash_with_retry(
+    client: BigIPClient,
+    command: str,
+    *,
+    timeout: int,
+    max_retries: int,
+    retry_delay: int,
+) -> Any:
+    """Run a bash command, retrying on transient timeout/connection errors."""
+    last_exc: Optional[Exception] = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            return client.run_bash(command, timeout=timeout)
+        except (
+            requests.exceptions.ReadTimeout,
+            requests.exceptions.ConnectionError,
+            requests.exceptions.Timeout,
+        ) as exc:
+            last_exc = exc
+            if attempt < max_retries:
+                time.sleep(retry_delay)
+                continue
+            raise
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("Unreachable: run_bash retry loop exited without a result.")
+
+
 def check_license_dates(
     client: BigIPClient,
     image_name: str,
@@ -408,12 +447,19 @@ def check_license_dates(
     result_id = "LIC-001"
     result_name = "ISO and service-check dates validated"
     remote_iso = f"/shared/images/{image_name}"
+    timeout = LICENSE_DATE_TIMEOUT_SECONDS
+    max_retries = LICENSE_DATE_MAX_RETRIES
+    retry_delay = LICENSE_DATE_RETRY_DELAY_SECONDS
+    stage = "version_date lookup"
 
     try:
-        version_response = client.run_bash(
+        version_response = _run_bash_with_retry(
+            client,
             "isoinfo -f -R -i "
             f"{_shell_quote(remote_iso)} | grep -m1 'version_date'",
-            timeout=120,
+            timeout=timeout,
+            max_retries=max_retries,
+            retry_delay=retry_delay,
         )
         version_path = next(
             (
@@ -426,18 +472,26 @@ def check_license_dates(
         if not version_path:
             raise ValueError("ISO version_date entry was not found.")
 
-        date_response = client.run_bash(
+        stage = "ISO license-check date read"
+        date_response = _run_bash_with_retry(
+            client,
             "isoinfo -R -i "
             f"{_shell_quote(remote_iso)} -x {_shell_quote(version_path)}",
-            timeout=120,
+            timeout=timeout,
+            max_retries=max_retries,
+            retry_delay=retry_delay,
         )
         iso_date = _extract_yyyymmdd(_remote_command_output(date_response))
         if not iso_date:
             raise ValueError("ISO license-check date was not found.")
 
-        service_response = client.run_bash(
+        stage = "service-check date read"
+        service_response = _run_bash_with_retry(
+            client,
             "grep -F 'Service check date' /config/bigip.license",
-            timeout=60,
+            timeout=timeout,
+            max_retries=max_retries,
+            retry_delay=retry_delay,
         )
         service_date = _extract_yyyymmdd(
             _remote_command_output(service_response)
@@ -471,6 +525,9 @@ def check_license_dates(
             status="FAIL",
             details={
                 "image": image_name,
+                "stage": stage,
+                "timeout_seconds": timeout,
+                "max_retries": max_retries,
                 "error": f"{type(exc).__name__}: {exc}",
             },
         )
