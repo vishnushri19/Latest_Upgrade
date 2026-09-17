@@ -133,27 +133,70 @@ class BigIPClient:
         """
         List devices in the trust domain.
         """
-        return self.get("/mgmt/tm/cm/device")
+        try:
+            return self.get("/mgmt/tm/cm/device", timeout=15)
+        except Exception:
+            resp = self.run_bash("tmsh -q list cm device 2>/dev/null", timeout=15)
+            return {"commandResult": resp.get("commandResult", "")}
 
     # ---------------- Platform / HA ----------------
 
     def system_version(self) -> Dict[str, Any]:
         """
         Get BIG-IP software version information.
+        Tries /mgmt/tm/sys/version first, falls back to cat /VERSION or tmsh.
         """
-        return self.get("/mgmt/tm/sys/version")
+        try:
+            return self.get("/mgmt/tm/sys/version", timeout=15)
+        except Exception:
+            resp = self.run_bash("cat /VERSION 2>/dev/null || tmsh -q show sys version", timeout=15)
+            cmd_res = str(resp.get("commandResult", ""))
+            return {
+                "entries": {
+                    "https://localhost/mgmt/tm/sys/version/0": {
+                        "nestedStats": {
+                            "entries": {
+                                "Version": {"description": cmd_res},
+                                "Build": {"description": cmd_res},
+                            }
+                        }
+                    }
+                },
+                "commandResult": cmd_res,
+            }
 
     def failover_state(self) -> Dict[str, Any]:
         """
         Get failover-status (ACTIVE/STANDBY, etc).
+        Tries /mgmt/tm/cm/failover-status, falls back to tmsh show cm failover-status.
         """
-        return self.get("/mgmt/tm/cm/failover-status")
+        try:
+            return self.get("/mgmt/tm/cm/failover-status", timeout=15)
+        except Exception:
+            resp = self.run_bash("tmsh -q show cm failover-status 2>/dev/null", timeout=15)
+            cmd_res = str(resp.get("commandResult", ""))
+            return {
+                "entries": {
+                    "https://localhost/mgmt/tm/cm/failover-status/0": {
+                        "nestedStats": {
+                            "entries": {
+                                "status": {"description": cmd_res}
+                            }
+                        }
+                    }
+                },
+                "commandResult": cmd_res,
+            }
 
     def sync_status(self) -> Dict[str, Any]:
         """
         Get config-sync status.
         """
-        return self.get("/mgmt/tm/cm/sync-status")
+        try:
+            return self.get("/mgmt/tm/cm/sync-status", timeout=15)
+        except Exception:
+            resp = self.run_bash("tmsh -q show cm sync-status 2>/dev/null", timeout=15)
+            return {"commandResult": resp.get("commandResult", "")}
 
     # ---------------- Software / Rollback ----------------
 
@@ -161,13 +204,23 @@ class BigIPClient:
         """
         List software images known to the system.
         """
-        return self.get("/mgmt/tm/sys/software/image")
+        try:
+            return self.get("/mgmt/tm/sys/software/image", timeout=15)
+        except Exception:
+            resp = self.run_bash("ls -1 /shared/images/*.iso 2>/dev/null | xargs -n1 basename", timeout=15)
+            cmd_res = str(resp.get("commandResult", ""))
+            items = [{"name": line.strip()} for line in cmd_res.splitlines() if line.strip()]
+            return {"items": items, "commandResult": cmd_res}
 
     def software_volumes(self) -> Dict[str, Any]:
         """
         List software volumes.
         """
-        return self.get("/mgmt/tm/sys/software/volume")
+        try:
+            return self.get("/mgmt/tm/sys/software/volume", timeout=15)
+        except Exception:
+            resp = self.run_bash("tmsh -q show sys software 2>/dev/null", timeout=15)
+            return {"commandResult": resp.get("commandResult", "")}
 
     # ---------------- Licensing ----------------
 
@@ -175,4 +228,8 @@ class BigIPClient:
         """
         Get license information.
         """
-        return self.get("/mgmt/tm/sys/license")
+        try:
+            return self.get("/mgmt/tm/sys/license", timeout=15)
+        except Exception:
+            resp = self.run_bash("tmsh -q show sys license 2>/dev/null", timeout=15)
+            return {"commandResult": resp.get("commandResult", "")}

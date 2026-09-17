@@ -63,18 +63,25 @@ class UpgradeFlow:
         results: List[CheckResult] = []
 
         # --- Version + role discovery (for idempotence and safety) ---
+        version_str = ""
         try:
             ver_payload = self.client.system_version()
             version_str = str(ver_payload)
-        except Exception as e:
-            version_str = ""
+        except Exception:
+            try:
+                resp = self.client.run_bash("cat /VERSION 2>/dev/null || tmsh -q show sys version", timeout=15)
+                version_str = str(resp.get("commandResult", ""))
+            except Exception:
+                pass
+
+        if not version_str:
             results.append(
                 CheckResult(
                     id="FLOW-VER-001",
                     category="Upgrade Flow",
                     name="Current version lookup failed",
                     status="FAIL",
-                    details={"error": str(e)},
+                    details={"error": "Could not determine system version via REST or TMSH."},
                 )
             )
             if self.should_stop(results):
