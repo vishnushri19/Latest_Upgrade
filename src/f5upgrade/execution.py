@@ -8,7 +8,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
@@ -44,34 +44,18 @@ def _shell_quote(value: str) -> str:
 def _remote_command_output(response: Any) -> str:
     if not isinstance(response, dict):
         return ""
-
-    return str(
-        response.get("commandResult", "")
-    ).strip()
+    return str(response.get("commandResult", "")).strip()
 
 
-def _extract_version_from_image_name(
-    image_iso_name: str,
-) -> str:
-    """
-    Extract a version from names such as:
-    BIGIP-17.5.1.9-0.0.12.iso
-    """
-    match = re.search(
-        r"BIGIP-(\d+(?:\.\d+)+)-",
-        image_iso_name or "",
-        re.IGNORECASE,
-    )
-
+def _extract_version_from_image_name(image_iso_name: str) -> str:
+    """Extract version from names such as: BIGIP-17.5.1.9-0.0.12.iso"""
+    match = re.search(r"BIGIP-(\d+(?:\.\d+)+)-", image_iso_name or "", re.IGNORECASE)
     return match.group(1) if match else ""
 
 
 def _is_fatal_tmsh_output(output: str) -> bool:
-    """
-    Detect tmsh output that indicates the command was rejected.
-    """
+    """Detect tmsh output that indicates the command was rejected."""
     text = (output or "").lower()
-
     fatal_markers = [
         "data input error",
         "syntax error",
@@ -85,17 +69,12 @@ def _is_fatal_tmsh_output(output: str) -> bool:
         "could not locate",
         "was not found",
     ]
-
-    return any(
-        marker in text
-        for marker in fatal_markers
-    )
+    return any(marker in text for marker in fatal_markers)
 
 
 def _available_iso_names(client: BigIPClient) -> List[str]:
     response = client.run_bash(
-        "ls -1 /shared/images/*.iso 2>/dev/null | "
-        "sed 's#^.*/##' | sort",
+        "ls -1 /shared/images/*.iso 2>/dev/null | sed 's#^.*/##' | sort",
         timeout=60,
     )
     return [
@@ -105,7 +84,7 @@ def _available_iso_names(client: BigIPClient) -> List[str]:
     ]
 
 
-def _available_space_kib(client: BigIPClient) -> tuple[int, str]:
+def _available_space_kib(client: BigIPClient) -> Tuple[int, str]:
     response = client.run_bash("df -Pk /shared/images", timeout=60)
     output = _remote_command_output(response)
     data_lines = [
@@ -121,59 +100,30 @@ def _available_space_kib(client: BigIPClient) -> tuple[int, str]:
         raise ValueError("Free-space value from df was not numeric.") from exc
 
 
-def _parse_volume_from_tmsh_status(
-    output: str,
-    volume: str,
-) -> VolumeState:
-    """
-    Parse one volume row from:
-
-      tmsh show sys software status
-    """
+def _parse_volume_from_tmsh_status(output: str, volume: str) -> VolumeState:
+    """Parse one volume row from: tmsh show sys software status"""
     for raw_line in (output or "").splitlines():
         line = raw_line.strip()
-
         if not line.startswith(volume):
             continue
 
         parts = line.split()
-
         version = parts[2] if len(parts) > 2 else ""
         build = parts[3] if len(parts) > 3 else ""
         active = parts[4] if len(parts) > 4 else ""
-
         lower = line.lower()
 
         if "installing" in lower:
-            pct_match = re.search(
-                r"installing\s+([\d.]+)\s+pct",
-                line,
-                re.IGNORECASE,
-            )
-
-            if pct_match:
-                status = (
-                    f"installing "
-                    f"{pct_match.group(1)} pct"
-                )
-            else:
-                status = "installing"
-
+            pct_match = re.search(r"installing\s+([\d.]+)\s+pct", line, re.IGNORECASE)
+            status = f"installing {pct_match.group(1)} pct" if pct_match else "installing"
         elif "complete" in lower:
             status = "complete"
-
         elif "failed" in lower:
             status = "failed"
-
         elif "error" in lower:
             status = "error"
-
         else:
-            status = (
-                " ".join(parts[5:])
-                if len(parts) > 5
-                else ""
-            )
+            status = " ".join(parts[5:]) if len(parts) > 5 else ""
 
         return VolumeState(
             found=True,
@@ -191,159 +141,81 @@ def _parse_volume_from_tmsh_status(
         volume=volume,
         source="tmsh_status",
         raw=output or "",
-        error=(
-            f"Volume {volume} was not found in "
-            "tmsh software status output."
-        ),
+        error=f"Volume {volume} was not found in tmsh software status output.",
     )
 
 
-def _get_volume_state(
-    client: BigIPClient,
-    volume: str,
-) -> VolumeState:
-    """
-    Read software volume state.
-
-    REST is attempted first. If the volume is not indexed yet, fall back
-    to tmsh show sys software status.
-    """
+def _get_volume_state(client: BigIPClient, volume: str) -> VolumeState:
+    """Read software volume state via REST with tmsh fallback."""
     try:
-        payload = client.get(
-            f"/mgmt/tm/sys/software/volume/{volume}"
-        )
-
+        payload = client.get(f"/mgmt/tm/sys/software/volume/{volume}", timeout=20)
         return VolumeState(
             found=True,
             volume=volume,
-            version=str(
-                payload.get("version", "")
-            ),
-            status=str(
-                payload.get("status", "")
-            ),
-            build=str(
-                payload.get("build", "")
-            ),
-            active=str(
-                payload.get("active", "")
-            ),
+            version=str(payload.get("version", "")),
+            status=str(payload.get("status", "")),
+            build=str(payload.get("build", "")),
+            active=str(payload.get("active", "")),
             source="icontrol_volume",
             raw=str(payload),
         )
-
     except Exception as rest_error:
         try:
-            response = client.run_bash(
-                "tmsh show sys software status"
-            )
-
+            response = client.run_bash("tmsh show sys software status", timeout=30)
             output = _remote_command_output(response)
-
-            parsed = _parse_volume_from_tmsh_status(
-                output,
-                volume,
-            )
-
+            parsed = _parse_volume_from_tmsh_status(output, volume)
             if parsed.found:
                 return parsed
-
             return VolumeState(
                 found=False,
                 volume=volume,
                 source="icontrol_then_tmsh_status",
                 raw=output,
-                error=(
-                    f"{type(rest_error).__name__}: "
-                    f"{rest_error}"
-                ),
+                error=f"{type(rest_error).__name__}: {rest_error}",
             )
-
         except Exception as tmsh_error:
             return VolumeState(
                 found=False,
                 volume=volume,
                 source="icontrol_then_tmsh_status",
-                error=(
-                    f"REST error: "
-                    f"{type(rest_error).__name__}: "
-                    f"{rest_error}; "
-                    f"tmsh status error: "
-                    f"{type(tmsh_error).__name__}: "
-                    f"{tmsh_error}"
-                ),
+                error=f"REST error: {type(rest_error).__name__}: {rest_error}; tmsh status error: {type(tmsh_error).__name__}: {tmsh_error}",
             )
 
 
 def _sha256_file(path: str) -> str:
     digest = hashlib.sha256()
-
     with open(path, "rb") as file_handle:
-        for block in iter(
-            lambda: file_handle.read(1024 * 1024),
-            b"",
-        ):
+        for block in iter(lambda: file_handle.read(1024 * 1024), b""):
             digest.update(block)
-
     return digest.hexdigest()
 
 
-def check_image_present(
-    client: BigIPClient,
-    image_name_contains: str,
-) -> ImagePresenceResult:
-    """
-    Verify that the ISO physically exists under /shared/images.
-
-    The filesystem result is authoritative. REST image inventory is retained
-    only as supplemental information because stale REST records can otherwise
-    cause the upload step to be skipped.
-    """
-    needle = (
-        image_name_contains or ""
-    ).strip().lower()
-
+def check_image_present(client: BigIPClient, image_name_contains: str) -> ImagePresenceResult:
+    """Verify that the ISO physically exists under /shared/images."""
+    needle = (image_name_contains or "").strip().lower()
     available_images = []
     rest_error = ""
 
     try:
         payload = client.software_images()
-
-        items = (
-            payload.get("items", [])
-            if isinstance(payload, dict)
-            else []
-        )
-
+        items = payload.get("items", []) if isinstance(payload, dict) else []
         available_images = [
             str(item.get("name"))
             for item in items
-            if isinstance(item, dict)
-            and item.get("name")
+            if isinstance(item, dict) and item.get("name")
         ]
-
     except Exception as exc:
         available_images = []
-        rest_error = (
-            f"{type(exc).__name__}: {exc}"
-        )
+        rest_error = f"{type(exc).__name__}: {exc}"
 
     try:
-        response = client.run_bash(
-            "ls -1 /shared/images/ "
-            "2>/dev/null | "
-            "head -n 500",
-            timeout=60,
-        )
-
+        response = client.run_bash("ls -1 /shared/images/ 2>/dev/null | head -n 500", timeout=60)
         output = _remote_command_output(response)
-
         filesystem_images = [
             line.strip()
             for line in output.splitlines()
             if line.strip().lower().endswith(".iso")
         ]
-
     except Exception as exc:
         return ImagePresenceResult(
             found=False,
@@ -353,23 +225,13 @@ def check_image_present(
                 "method": "filesystem",
                 "available_images": available_images,
                 "rest_error": rest_error,
-                "error": (
-                    "Could not inspect /shared/images: "
-                    f"{type(exc).__name__}: {exc}"
-                ),
+                "error": f"Could not inspect /shared/images: {type(exc).__name__}: {exc}",
             },
         )
 
-
-    filesystem_matches = [
-        image
-        for image in filesystem_images
-        if needle in image.lower()
-    ]
-
+    filesystem_matches = [image for image in filesystem_images if needle in image.lower()]
     if filesystem_matches:
         matched = filesystem_matches[0]
-
         return ImagePresenceResult(
             found=True,
             matched_name=matched,
@@ -392,240 +254,9 @@ def check_image_present(
             "filesystem_images": filesystem_images,
             "rest_available_images": available_images,
             "rest_error": rest_error,
-            "rest_inventory_may_be_stale": any(
-                needle in image.lower()
-                for image in available_images
-            ),
+            "rest_inventory_may_be_stale": any(needle in image.lower() for image in available_images),
         },
     )
-
-
-LICENSE_DATE_TIMEOUT_SECONDS = int(
-    os.environ.get("LICENSE_DATE_TIMEOUT_SECONDS", "60")
-)
-LICENSE_DATE_MAX_RETRIES = int(
-    os.environ.get("LICENSE_DATE_MAX_RETRIES", "2")
-)
-LICENSE_DATE_RETRY_DELAY_SECONDS = int(
-    os.environ.get("LICENSE_DATE_RETRY_DELAY_SECONDS", "15")
-)
-
-
-def _run_bash_via_ssh(
-    ssh_host: str,
-    ssh_user: str,
-    command: str,
-    timeout: int,
-    control_path: Optional[str] = None,
-) -> Dict[str, str]:
-    """
-    Run a read-only bash command over SSH and wrap stdout the same way
-    BigIPClient.run_bash() would (as 'commandResult'), so callers can treat
-    both response shapes identically.
-
-    This is used as a fallback when the REST util/bash endpoint
-    (restjavad/icrd) is unresponsive, which has been observed shortly after
-    heavy backup operations (UCS/QKView/ASMQKView).
-
-    If control_path points at an already-open, authenticated OpenSSH
-    ControlMaster socket (see scripts/run_upgrade_node.py's shared backup
-    SSH session), the command is multiplexed onto that existing connection
-    and does not require any new authentication or password prompt. Without
-    a control_path, a brand-new connection is opened, which may prompt for
-    a password and can therefore time out unattended.
-    """
-    ssh_opts = [
-        "-o",
-        "StrictHostKeyChecking=accept-new",
-        "-o",
-        f"ConnectTimeout={min(timeout, 30)}",
-    ]
-    if control_path:
-        ssh_opts += [
-            "-o",
-            f"ControlPath={control_path}",
-            "-o",
-            "ControlMaster=auto",
-        ]
-    ssh_command = [
-        "ssh",
-        *ssh_opts,
-        f"{ssh_user}@{ssh_host}",
-        f"bash -lc {shlex.quote(command)}",
-    ]
-    completed = subprocess.run(
-        ssh_command,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-    )
-    if completed.returncode != 0:
-        raise RuntimeError(
-            f"SSH command failed (exit {completed.returncode}): "
-            f"{completed.stderr.strip() or completed.stdout.strip()}"
-        )
-    return {"commandResult": completed.stdout}
-
-
-def _run_bash_with_retry(
-    client: BigIPClient,
-    command: str,
-    *,
-    timeout: int,
-    max_retries: int,
-    retry_delay: int,
-    ssh_host: Optional[str] = None,
-    ssh_user: Optional[str] = None,
-    ssh_control_path: Optional[str] = None,
-) -> Any:
-    """
-    Run a bash command via REST, retrying on transient timeout/connection
-    errors. If all REST attempts fail and SSH fallback details are provided,
-    fall back to a direct SSH command so a REST daemon hiccup (for example,
-    restjavad still recovering right after heavy backup operations) does not
-    fail the check outright.
-    """
-    last_exc: Optional[Exception] = None
-    for attempt in range(1, max_retries + 1):
-        try:
-            return client.run_bash(command, timeout=timeout)
-        except (
-            requests.exceptions.ReadTimeout,
-            requests.exceptions.ConnectionError,
-            requests.exceptions.Timeout,
-        ) as exc:
-            last_exc = exc
-            if attempt < max_retries:
-                time.sleep(retry_delay)
-                continue
-
-    if ssh_host and ssh_user:
-        try:
-            return _run_bash_via_ssh(
-                ssh_host,
-                ssh_user,
-                command,
-                timeout=timeout,
-                control_path=ssh_control_path,
-            )
-        except Exception as ssh_exc:
-            raise RuntimeError(
-                f"REST fallback via SSH also failed: {ssh_exc}"
-            ) from (last_exc or ssh_exc)
-
-    if last_exc:
-        raise last_exc
-    raise RuntimeError("Unreachable: run_bash retry loop exited without a result.")
-
-
-def check_license_dates(
-    client: BigIPClient,
-    image_name: str,
-    ssh_user: Optional[str] = None,
-    ssh_control_path: Optional[str] = None,
-) -> CheckResult:
-    """Validate the ISO license-check date against the device service date."""
-    result_id = "LIC-001"
-    result_name = "ISO and service-check dates validated"
-    remote_iso = f"/shared/images/{image_name}"
-    timeout = LICENSE_DATE_TIMEOUT_SECONDS
-    max_retries = LICENSE_DATE_MAX_RETRIES
-    retry_delay = LICENSE_DATE_RETRY_DELAY_SECONDS
-    ssh_host = client.host if ssh_user else None
-    stage = "version_date lookup"
-
-    try:
-        version_response = _run_bash_with_retry(
-            client,
-            "isoinfo -f -R -i "
-            f"{_shell_quote(remote_iso)} | grep -m1 'version_date'",
-            timeout=timeout,
-            max_retries=max_retries,
-            retry_delay=retry_delay,
-            ssh_host=ssh_host,
-            ssh_user=ssh_user,
-            ssh_control_path=ssh_control_path,
-        )
-        version_path = next(
-            (
-                line.strip()
-                for line in _remote_command_output(version_response).splitlines()
-                if "version_date" in line
-            ),
-            "",
-        )
-        if not version_path:
-            raise ValueError("ISO version_date entry was not found.")
-
-        stage = "ISO license-check date read"
-        date_response = _run_bash_with_retry(
-            client,
-            "isoinfo -R -i "
-            f"{_shell_quote(remote_iso)} -x {_shell_quote(version_path)}",
-            timeout=timeout,
-            max_retries=max_retries,
-            retry_delay=retry_delay,
-            ssh_host=ssh_host,
-            ssh_user=ssh_user,
-            ssh_control_path=ssh_control_path,
-        )
-        iso_date = _extract_yyyymmdd(_remote_command_output(date_response))
-        if not iso_date:
-            raise ValueError("ISO license-check date was not found.")
-
-        stage = "service-check date read"
-        service_response = _run_bash_with_retry(
-            client,
-            "grep -F 'Service check date' /config/bigip.license",
-            timeout=timeout,
-            max_retries=max_retries,
-            retry_delay=retry_delay,
-            ssh_host=ssh_host,
-            ssh_user=ssh_user,
-            ssh_control_path=ssh_control_path,
-        )
-        service_date = _extract_yyyymmdd(
-            _remote_command_output(service_response)
-        )
-        if not service_date:
-            raise ValueError("BIG-IP service-check date was not found.")
-
-        reactivation_required = service_date < iso_date
-        return CheckResult(
-            id=result_id,
-            category="License and Platform Readiness",
-            name=result_name,
-            status="FAIL" if reactivation_required else "PASS",
-            details={
-                "image": image_name,
-                "iso_license_check_date": iso_date,
-                "service_check_date": service_date,
-                "license_reactivation_required": reactivation_required,
-                "error": (
-                    "License reactivation is required before upgrade."
-                    if reactivation_required
-                    else ""
-                ),
-            },
-        )
-    except Exception as exc:
-        return CheckResult(
-            id=result_id,
-            category="License and Platform Readiness",
-            name=result_name,
-            status="FAIL",
-            details={
-                "image": image_name,
-                "stage": stage,
-                "timeout_seconds": timeout,
-                "max_retries": max_retries,
-                "ssh_fallback_attempted": bool(ssh_host and ssh_user),
-                "ssh_fallback_reused_existing_connection": bool(
-                    ssh_control_path
-                ),
-                "error": f"{type(exc).__name__}: {exc}",
-            },
-        )
 
 
 def _extract_yyyymmdd(output: str) -> str:
@@ -645,12 +276,7 @@ def prepare_install_storage(
     expected_image_contains: str = "",
     skip_iso_cleanup: bool = False,
 ) -> CheckResult:
-    """
-    Display storage state and safely prepare an inactive target volume.
-
-    The filesystem containing /shared/images must have at least 8 GiB free
-    when an upload is requested. The active boot volume is never deleted.
-    """
+    """Display storage state and safely prepare an inactive target volume."""
     result_id = "EXEC-STORAGE-001"
     result_name = "Storage and target volume readiness"
     details: Dict[str, Any] = {"target_volume": target_volume}
@@ -682,10 +308,7 @@ def prepare_install_storage(
         )
         details["skipped_iso_cleanup"] = True
     else:
-        image_response = client.run_bash(
-            "ls -lh /shared/images/ 2>/dev/null | head -n 500",
-            timeout=60,
-        )
+        image_response = client.run_bash("ls -lh /shared/images/ 2>/dev/null | head -n 500", timeout=60)
         image_listing = _remote_command_output(image_response)
         details["image_listing"] = image_listing
         print("\nImages under /shared/images:")
@@ -706,10 +329,7 @@ def prepare_install_storage(
                     )
                 details["disk_usage"] = df_output
                 available_gib = available_kib / (1024 * 1024)
-                print(
-                    f"\n/shared/images filesystem free space: {available_gib:.2f} GiB "
-                    "(minimum 8.00 GiB)"
-                )
+                print(f"\n/shared/images filesystem free space: {available_gib:.2f} GiB (minimum 8.00 GiB)")
                 if available_kib >= required_kib:
                     break
 
@@ -724,10 +344,7 @@ def prepare_install_storage(
                             **details,
                             "available_gib": round(available_gib, 2),
                             "required_gib": 8,
-                            "error": (
-                                "Insufficient free space to upload the ISO "
-                                "and no ISO files remain for cleanup."
-                            ),
+                            "error": "Insufficient free space to upload the ISO and no ISO files remain for cleanup.",
                         },
                     )
 
@@ -748,18 +365,10 @@ def prepare_install_storage(
                         },
                     )
 
-                answer = input(
-                    "Free space is below 8 GiB. Delete ISO files? "
-                    "Enter numbers separated by commas: "
-                ).strip()
+                answer = input("Free space is below 8 GiB. Delete ISO files? Enter numbers separated by commas: ").strip()
                 try:
-                    selected = sorted(
-                        {int(item.strip()) for item in answer.split(",")}
-                    )
-                    if not selected or any(
-                        index < 1 or index > len(image_names)
-                        for index in selected
-                    ):
+                    selected = sorted({int(item.strip()) for item in answer.split(",")})
+                    if not selected or any(index < 1 or index > len(image_names) for index in selected):
                         raise IndexError
                     selected_names = [image_names[index - 1] for index in selected]
                 except (ValueError, IndexError):
@@ -781,17 +390,11 @@ def prepare_install_storage(
                         category="Execution Readiness",
                         name=result_name,
                         status="FAIL",
-                        details={
-                            **details,
-                            "error": "ISO deletion was not confirmed while space was insufficient.",
-                        },
+                        details={**details, "error": "ISO deletion was not confirmed while space was insufficient."},
                     )
 
                 for name in selected_names:
-                    delete_response = client.run_bash(
-                        f"rm -f -- {_shell_quote('/shared/images/' + name)}",
-                        timeout=60,
-                    )
+                    delete_response = client.run_bash(f"rm -f -- {_shell_quote('/shared/images/' + name)}", timeout=60)
                     delete_output = _remote_command_output(delete_response)
                     if _is_fatal_tmsh_output(delete_output):
                         return CheckResult(
@@ -808,10 +411,7 @@ def prepare_install_storage(
                         )
                 details.setdefault("deleted_iso_files", []).extend(selected_names)
 
-    volume_response = client.run_bash(
-        "tmsh show sys software",
-        timeout=60,
-    )
+    volume_response = client.run_bash("tmsh show sys software", timeout=60)
     volume_listing = _remote_command_output(volume_response)
     details["volume_listing"] = volume_listing
     print("\nAvailable software volumes:")
@@ -859,10 +459,7 @@ def prepare_install_storage(
             details=details,
         )
 
-    print(
-        f"\nTarget volume {target_volume} contains version "
-        f"{existing.version or '(unknown)'} with status '{existing.status}'."
-    )
+    print(f"\nTarget volume {target_volume} contains version {existing.version or '(unknown)'} with status '{existing.status}'.")
     if not sys.stdin.isatty():
         return CheckResult(
             id=result_id,
@@ -872,9 +469,7 @@ def prepare_install_storage(
             details={**details, "volume_state": existing.__dict__, "error": "Target volume cleanup requires confirmation."},
         )
 
-    answer = input(
-        f"Delete and recreate inactive volume {target_volume}? (y/N): "
-    ).strip().lower()
+    answer = input(f"Delete and recreate inactive volume {target_volume}? (y/N): ").strip().lower()
     if answer not in ("y", "yes"):
         return CheckResult(
             id=result_id,
@@ -885,10 +480,7 @@ def prepare_install_storage(
         )
 
     delete_output = _remote_command_output(
-        client.run_bash(
-            f"tmsh delete sys software volume {_shell_quote(target_volume)}",
-            timeout=120,
-        )
+        client.run_bash(f"tmsh delete sys software volume {_shell_quote(target_volume)}", timeout=120)
     )
     if _is_fatal_tmsh_output(delete_output):
         return CheckResult(
@@ -915,36 +507,18 @@ def exec_upload_iso_standby(
     scp_user: str,
     iso_local_path: str,
 ) -> CheckResult:
-    """
-    Upload the ISO to /shared/images on a standby BIG-IP.
-
-    SCP uses uppercase -O to force legacy SCP instead of SFTP.
-    The uploaded file is verified using size and SHA-256.
-    """
+    """Upload the ISO to /shared/images on a standby BIG-IP."""
     result_id = "EXEC-UPLOAD-ISO-001"
-    result_name = (
-        "Upload ISO to /shared/images "
-        "(standby only)"
-    )
+    result_name = "Upload ISO to /shared/images (standby only)"
 
-    role = (
-        get_failover_role(client)
-        or ""
-    ).lower()
-
+    role = (get_failover_role(client) or "").lower()
     if role != "standby":
         return CheckResult(
             id=result_id,
             category="Execution",
             name=result_name,
             status="FAIL",
-            details={
-                "error": (
-                    "Refusing upload because device "
-                    "is not STANDBY."
-                ),
-                "role": role,
-            },
+            details={"error": "Refusing upload because device is not STANDBY.", "role": role},
         )
 
     if not iso_local_path:
@@ -953,103 +527,53 @@ def exec_upload_iso_standby(
             category="Execution",
             name=result_name,
             status="FAIL",
-            details={
-                "error": "ISO_LOCAL_PATH is empty."
-            },
+            details={"error": "ISO_LOCAL_PATH is empty."},
         )
 
-    iso_local_path = os.path.expanduser(
-        iso_local_path
-    )
-
+    iso_local_path = os.path.expanduser(iso_local_path)
     if not os.path.isfile(iso_local_path):
         return CheckResult(
             id=result_id,
             category="Execution",
             name=result_name,
             status="FAIL",
-            details={
-                "error": (
-                    "ISO_LOCAL_PATH does not exist "
-                    "or is not a file."
-                ),
-                "iso_local_path": iso_local_path,
-            },
+            details={"error": "ISO_LOCAL_PATH does not exist or is not a file.", "iso_local_path": iso_local_path},
         )
 
-    basename = os.path.basename(
-        iso_local_path
-    )
-
+    basename = os.path.basename(iso_local_path)
     remote_path = f"/shared/images/{basename}"
-    destination = (
-        f"{scp_user}@{host}:/shared/images/"
-    )
+    destination = f"{scp_user}@{host}:/shared/images/"
+    local_size = os.path.getsize(iso_local_path)
+    local_sha256 = _sha256_file(iso_local_path)
 
-    local_size = os.path.getsize(
-        iso_local_path
-    )
+    command = ["scp", "-O", iso_local_path, destination]
 
-    local_sha256 = _sha256_file(
-        iso_local_path
-    )
-
-    command = [
-        "scp",
-        "-O",
-        iso_local_path,
-        destination,
-    ]
-
-    print(
-        "\nUploading ISO to BIG-IP /shared/images ..."
-    )
-    print(
-        f"Source: {iso_local_path}"
-    )
-    print(
-        f"Destination: {destination}"
-    )
-    print(
-        "Using legacy SCP protocol with -O; remote timestamps are not preserved."
-    )
+    print("\nUploading ISO to BIG-IP /shared/images ...")
+    print(f"Source: {iso_local_path}")
+    print(f"Destination: {destination}")
+    print("Using legacy SCP protocol with -O; remote timestamps are not preserved.")
 
     started = time.monotonic()
-
     try:
-        completed = subprocess.run(
-            command,
-            timeout=3600,
-        )
-
+        completed = subprocess.run(command, timeout=3600)
     except subprocess.TimeoutExpired:
         return CheckResult(
             id=result_id,
             category="Execution",
             name=result_name,
             status="FAIL",
-            details={
-                "error": (
-                    "SCP upload timed out."
-                ),
-                "command": " ".join(command),
-            },
+            details={"error": "SCP upload timed out.", "command": " ".join(command)},
         )
-
     except Exception as exc:
         return CheckResult(
             id=result_id,
             category="Execution",
             name=result_name,
             status="FAIL",
-            details={
-                "error": str(exc),
-                "command": " ".join(command),
-            },
+            details={"error": str(exc), "command": " ".join(command)},
         )
 
     elapsed = time.monotonic() - started
-
     if completed.returncode != 0:
         return CheckResult(
             id=result_id,
@@ -1060,28 +584,14 @@ def exec_upload_iso_standby(
                 "error": "SCP upload failed.",
                 "command": " ".join(command),
                 "returncode": completed.returncode,
-                "elapsed_seconds": round(
-                    elapsed,
-                    3,
-                ),
+                "elapsed_seconds": round(elapsed, 3),
             },
         )
 
-    verify_command = (
-        f"test -f {_shell_quote(remote_path)} && "
-        f"stat -c %s {_shell_quote(remote_path)} && "
-        f"sha256sum {_shell_quote(remote_path)}"
-    )
-
+    verify_command = f"test -f {_shell_quote(remote_path)} && stat -c %s {_shell_quote(remote_path)} && sha256sum {_shell_quote(remote_path)}"
     try:
-        verify_response = client.run_bash(
-            verify_command,
-            timeout=120,
-        )
-
-        verify_output = _remote_command_output(
-            verify_response
-        )
+        verify_response = client.run_bash(verify_command, timeout=120)
+        verify_output = _remote_command_output(verify_response)
 
         if not verify_output:
             return CheckResult(
@@ -1089,64 +599,27 @@ def exec_upload_iso_standby(
                 category="Execution",
                 name=result_name,
                 status="FAIL",
-                details={
-                    "error": (
-                        "Remote ISO verification returned "
-                        "no output."
-                    ),
-                    "remote_path": remote_path,
-                },
+                details={"error": "Remote ISO verification returned no output.", "remote_path": remote_path},
             )
 
         remote_size = None
         remote_sha256 = None
-
         for line in verify_output.splitlines():
             line = line.strip()
-
             if line.isdigit():
                 remote_size = int(line)
                 continue
-
-            hash_match = re.search(
-                r"\b([0-9a-fA-F]{64})\b",
-                line,
-            )
-
+            hash_match = re.search(r"\b([0-9a-fA-F]{64})\b", line)
             if hash_match:
-                remote_sha256 = (
-                    hash_match.group(1).lower()
-                )
+                remote_sha256 = hash_match.group(1).lower()
 
-        if remote_size is None:
+        if remote_size is None or remote_sha256 is None:
             return CheckResult(
                 id=result_id,
                 category="Execution",
                 name=result_name,
                 status="FAIL",
-                details={
-                    "error": (
-                        "Could not determine remote ISO size."
-                    ),
-                    "remote_path": remote_path,
-                    "verification_output": verify_output,
-                },
-            )
-
-        if remote_sha256 is None:
-            return CheckResult(
-                id=result_id,
-                category="Execution",
-                name=result_name,
-                status="FAIL",
-                details={
-                    "error": (
-                        "Could not determine remote ISO "
-                        "SHA-256."
-                    ),
-                    "remote_path": remote_path,
-                    "verification_output": verify_output,
-                },
+                details={"error": "Could not determine remote ISO size or hash.", "remote_path": remote_path},
             )
 
         if remote_size != local_size:
@@ -1155,15 +628,7 @@ def exec_upload_iso_standby(
                 category="Execution",
                 name=result_name,
                 status="FAIL",
-                details={
-                    "error": (
-                        "Remote ISO size does not match "
-                        "local ISO size."
-                    ),
-                    "remote_path": remote_path,
-                    "local_size": local_size,
-                    "remote_size": remote_size,
-                },
+                details={"error": "Remote ISO size does not match local size.", "remote_path": remote_path, "local_size": local_size, "remote_size": remote_size},
             )
 
         if remote_sha256 != local_sha256:
@@ -1172,15 +637,7 @@ def exec_upload_iso_standby(
                 category="Execution",
                 name=result_name,
                 status="FAIL",
-                details={
-                    "error": (
-                        "Remote ISO SHA-256 does not match "
-                        "local ISO SHA-256."
-                    ),
-                    "remote_path": remote_path,
-                    "local_sha256": local_sha256,
-                    "remote_sha256": remote_sha256,
-                },
+                details={"error": "Remote ISO SHA-256 does not match local hash.", "remote_path": remote_path, "local_sha256": local_sha256, "remote_sha256": remote_sha256},
             )
 
         return CheckResult(
@@ -1195,26 +652,16 @@ def exec_upload_iso_standby(
                 "local_size": local_size,
                 "remote_size": remote_size,
                 "sha256": local_sha256,
-                "elapsed_seconds": round(
-                    elapsed,
-                    3,
-                ),
+                "elapsed_seconds": round(elapsed, 3),
             },
         )
-
     except Exception as exc:
         return CheckResult(
             id=result_id,
             category="Execution",
             name=result_name,
             status="FAIL",
-            details={
-                "error": (
-                    "Exception while verifying uploaded ISO."
-                ),
-                "remote_path": remote_path,
-                "exception": str(exc),
-            },
+            details={"error": "Exception while verifying uploaded ISO.", "remote_path": remote_path, "exception": str(exc)},
         )
 
 
@@ -1222,16 +669,11 @@ def exec_upload_files_standby(
     client: BigIPClient,
     host: str,
     scp_user: str,
-    iso_local_paths: list[str],
-) -> list[CheckResult]:
+    iso_local_paths: List[str],
+) -> List[CheckResult]:
     """Upload multiple ISO files sequentially, verifying each upload."""
     return [
-        exec_upload_iso_standby(
-            client,
-            host=host,
-            scp_user=scp_user,
-            iso_local_path=path,
-        )
+        exec_upload_iso_standby(client, host=host, scp_user=scp_user, iso_local_path=path)
         for path in iso_local_paths
     ]
 
@@ -1244,76 +686,30 @@ def exec_install_standby(
     force_install: bool = False,
     create_volume: Optional[bool] = None,
 ) -> CheckResult:
-    """
-    Submit image installation to the target standby volume.
-    """
-    result_id = (
-        "EXEC-INSTALL-001"
-    )
+    """Submit image installation to the target standby volume."""
+    result_id = "EXEC-INSTALL-001"
+    result_name = "Install image to standby volume (no reboot)"
 
-    result_name = (
-        "Install image to standby volume "
-        "(no reboot)"
-    )
-
-    role = (
-        get_failover_role(client)
-        or ""
-    ).lower()
-
+    role = (get_failover_role(client) or "").lower()
     if role != "standby":
         return CheckResult(
             id=result_id,
             category="Execution",
             name=result_name,
             status="FAIL",
-            details={
-                "error": (
-                    "Refusing install because device "
-                    "is not STANDBY."
-                ),
-                "role": role,
-            },
+            details={"error": "Refusing install because device is not STANDBY.", "role": role},
         )
 
-    expected_version = (
-        _extract_version_from_image_name(
-            image_iso_name
-        )
-    )
-
-    existing = _get_volume_state(
-        client,
-        target_volume,
-    )
+    expected_version = _extract_version_from_image_name(image_iso_name)
+    existing = _get_volume_state(client, target_volume)
 
     if existing.found:
         status = existing.status.lower()
-        version_matches = bool(
-            expected_version
-            and expected_version in existing.version
-        )
+        version_matches = bool(expected_version and expected_version in existing.version)
+        progress_states = ["installing", "complete", "testing", "copying", "pending", "waiting", "validating"]
 
-        progress_states = [
-            "installing",
-            "complete",
-            "testing",
-            "copying",
-            "pending",
-            "waiting",
-            "validating",
-        ]
-
-        if not force_install and version_matches and any(
-            state in status
-            for state in progress_states
-        ):
-            print(
-                f"\nTarget volume {target_volume} already "
-                f"exists with version {existing.version} "
-                f"and status '{existing.status}'."
-            )
-
+        if not force_install and version_matches and any(state in status for state in progress_states):
+            print(f"\nTarget volume {target_volume} already exists with version {existing.version} and status '{existing.status}'.")
             return CheckResult(
                 id=result_id,
                 category="Execution",
@@ -1323,10 +719,7 @@ def exec_install_standby(
                     "role": role,
                     "image": image_iso_name,
                     "chosen_volume": target_volume,
-                    "note": (
-                        "Target volume already exists with "
-                        "the expected version."
-                    ),
+                    "note": "Target volume already exists with the expected version.",
                     "volume_state": existing.__dict__,
                 },
             )
@@ -1341,10 +734,7 @@ def exec_install_standby(
                     "role": role,
                     "image": image_iso_name,
                     "chosen_volume": target_volume,
-                    "error": (
-                        "Target volume already exists but does "
-                        "not contain the expected target version."
-                    ),
+                    "error": "Target volume already exists but does not contain the expected target version.",
                     "expected_version": expected_version,
                     "volume_state": existing.__dict__,
                 },
@@ -1357,51 +747,25 @@ def exec_install_standby(
             category="Execution",
             name=result_name,
             status="FAIL",
-            details={
-                "role": role,
-                "image": image_iso_name,
-                "chosen_volume": target_volume,
-                "error": (
-                    "Image name must be a filename located directly "
-                    "under /shared/images."
-                ),
-            },
+            details={"role": role, "image": image_iso_name, "chosen_volume": target_volume, "error": "Image name must be a filename located directly under /shared/images."},
         )
 
     install_type = "hotfix" if _is_hotfix_image(image_name) else "image"
     if create_volume is None:
         create_volume = not existing.found
 
-    # BIG-IP 17.5 accepts the image filename with the volume property. Run
-    # from /shared/images so tmsh can resolve the file without treating an
-    # absolute path as a slot ID.
     image_path = f"/shared/images/{image_name}"
-    tmsh_command = (
-        f"cd /shared/images && "
-        f"tmsh install sys software {install_type} "
-        f"{_shell_quote(image_name)} "
-        f"volume {_shell_quote(target_volume)}"
-    )
+    tmsh_command = f"cd /shared/images && tmsh install sys software {install_type} {_shell_quote(image_name)} volume {_shell_quote(target_volume)}"
     if create_volume:
         tmsh_command += " create-volume"
 
-    print(
-        "\nSubmitting BIG-IP software install command:"
-    )
+    print("\nSubmitting BIG-IP software install command:")
     print(tmsh_command)
-    print(
-        "Install progress will be monitored "
-        "in the next step."
-    )
+    print("Install progress will be monitored in the next step.")
 
     try:
-        response = client.run_bash(
-            tmsh_command
-        )
-
-        output = _remote_command_output(
-            response
-        )
+        response = client.run_bash(tmsh_command, timeout=120)
+        output = _remote_command_output(response)
 
         if _is_fatal_tmsh_output(output):
             return CheckResult(
@@ -1416,10 +780,7 @@ def exec_install_standby(
                     "image_path": image_path,
                     "chosen_volume": target_volume,
                     "tmsh": tmsh_command,
-                    "error": (
-                        "BIG-IP rejected the install "
-                        "command."
-                    ),
+                    "error": "BIG-IP rejected the install command.",
                     "command_result": output,
                 },
             )
@@ -1436,14 +797,10 @@ def exec_install_standby(
                 "image_path": image_path,
                 "chosen_volume": target_volume,
                 "tmsh": tmsh_command,
-                "note": (
-                    "Install command submitted. Completion "
-                    "is verified by volume readiness polling."
-                ),
+                "note": "Install command submitted. Completion is verified by volume readiness polling.",
                 "command_result": output,
             },
         )
-
     except Exception as exc:
         return CheckResult(
             id=result_id,
@@ -1469,42 +826,18 @@ def exec_volume_ready(
     timeout_sec: int = 3600,
     interval_sec: int = 20,
 ) -> CheckResult:
-    """
-    Wait for target-volume installation to complete.
-    """
+    """Wait for target-volume installation to complete."""
     result_id = "EXEC-VOL-READY-001"
     result_name = "Target volume ready"
-
     deadline = time.time() + timeout_sec
+    last: Dict[str, Any] = {"volume": volume, "version": "", "status": "", "source": "", "error": ""}
 
-    last: Dict[str, Any] = {
-        "volume": volume,
-        "version": "",
-        "status": "",
-        "source": "",
-        "error": "",
-    }
-
-    print(
-        f"\nWaiting for target volume {volume} "
-        "to become ready."
-    )
-
-    print(
-        f"Expected version contains: "
-        f"{expect_version_contains}"
-    )
+    print(f"\nWaiting for target volume {volume} to become ready.")
+    print(f"Expected version contains: {expect_version_contains}")
 
     while time.time() < deadline:
-        state = _get_volume_state(
-            client,
-            volume,
-        )
-
-        remaining = max(
-            0,
-            int(deadline - time.time()),
-        )
+        state = _get_volume_state(client, volume)
+        remaining = max(0, int(deadline - time.time()))
 
         last = {
             "volume": state.volume,
@@ -1519,28 +852,14 @@ def exec_volume_ready(
         }
 
         if not state.found:
-            print(
-                f"[{_now()}] Volume {volume} is not "
-                f"visible yet. Remaining: {remaining}s"
-            )
-
+            print(f"[{_now()}] Volume {volume} is not visible yet. Remaining: {remaining}s")
             time.sleep(interval_sec)
             continue
 
         status = state.status.lower()
+        version_matches = bool(expect_version_contains and expect_version_contains in state.version)
 
-        version_matches = bool(
-            expect_version_contains
-            and expect_version_contains in state.version
-        )
-
-        print(
-            f"[{_now()}] Volume {volume}: "
-            f"version='{state.version}', "
-            f"status='{state.status}', "
-            f"source='{state.source}', "
-            f"remaining={remaining}s"
-        )
+        print(f"[{_now()}] Volume {volume}: version='{state.version}', status='{state.status}', source='{state.source}', remaining={remaining}s")
 
         if "failed" in status or "error" in status:
             return CheckResult(
@@ -1548,31 +867,11 @@ def exec_volume_ready(
                 category="Execution",
                 name=result_name,
                 status="FAIL",
-                details={
-                    "error": (
-                        "BIG-IP reports a failed/error "
-                        "state for the target volume."
-                    ),
-                    **last,
-                    "expected_version": (
-                        expect_version_contains
-                    ),
-                },
+                details={"error": "BIG-IP reports a failed/error state for the target volume.", **last, "expected_version": expect_version_contains},
             )
 
-        progress_states = [
-            "installing",
-            "testing",
-            "copying",
-            "pending",
-            "waiting",
-            "validating",
-        ]
-
-        if any(
-            state_name in status
-            for state_name in progress_states
-        ):
+        progress_states = ["installing", "testing", "copying", "pending", "waiting", "validating"]
+        if any(state_name in status for state_name in progress_states):
             time.sleep(interval_sec)
             continue
 
@@ -1583,16 +882,7 @@ def exec_volume_ready(
                     category="Execution",
                     name=result_name,
                     status="FAIL",
-                    details={
-                        "error": (
-                            "Target volume is complete but "
-                            "the version does not match."
-                        ),
-                        **last,
-                        "expected_version": (
-                            expect_version_contains
-                        ),
-                    },
+                    details={"error": "Target volume is complete but the version does not match.", **last, "expected_version": expect_version_contains},
                 )
 
             return CheckResult(
@@ -1600,16 +890,7 @@ def exec_volume_ready(
                 category="Execution",
                 name=result_name,
                 status="PASS",
-                details={
-                    "note": (
-                        "Target volume installation is complete "
-                        "and the version matches."
-                    ),
-                    **last,
-                    "expected_version": (
-                        expect_version_contains
-                    ),
-                },
+                details={"note": "Target volume installation is complete and the version matches.", **last, "expected_version": expect_version_contains},
             )
 
         time.sleep(interval_sec)
@@ -1619,107 +900,47 @@ def exec_volume_ready(
         category="Execution",
         name=result_name,
         status="FAIL",
-        details={
-            "error": (
-                "Timeout waiting for target volume "
-                "installation to complete."
-            ),
-            **last,
-            "expected_version": (
-                expect_version_contains
-            ),
-            "timeout_sec": timeout_sec,
-        },
+        details={"error": "Timeout waiting for target volume installation to complete.", **last, "expected_version": expect_version_contains, "timeout_sec": timeout_sec},
     )
 
 
 def _now() -> str:
-    return time.strftime(
-        "%Y-%m-%d %H:%M:%S"
-    )
+    return time.strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _is_expected_reboot_disconnect(
-    error: Exception,
-) -> bool:
+def _is_expected_reboot_disconnect(error: Exception) -> bool:
     text = str(error).lower()
-
-    return any(
-        marker in text
-        for marker in (
-            "remotedisconnected",
-            "remote end closed connection",
-            "connection aborted",
-            "connection reset",
-            "badstatusline",
-        )
-    )
+    return any(marker in text for marker in ("remotedisconnected", "remote end closed connection", "connection aborted", "connection reset", "badstatusline"))
 
 
-def exec_reboot_to_volume_standby(
-    client: BigIPClient,
-    volume: str,
-) -> CheckResult:
-    """
-    Reboot the standby BIG-IP into the target volume.
-    """
+def exec_reboot_to_volume_standby(client: BigIPClient, volume: str) -> CheckResult:
+    """Reboot the standby BIG-IP into the target volume."""
     result_id = "EXEC-REBOOT-TO-VOL-001"
-    result_name = (
-        "Reboot to target volume "
-        "(standby only)"
-    )
+    result_name = "Reboot to target volume (standby only)"
 
-    role = (
-        get_failover_role(client)
-        or ""
-    ).lower()
-
+    role = (get_failover_role(client) or "").lower()
     if role != "standby":
         return CheckResult(
             id=result_id,
             category="Execution",
             name=result_name,
             status="FAIL",
-            details={
-                "error": (
-                    "Refusing reboot because device "
-                    "is not STANDBY."
-                ),
-                "role": role,
-                "volume": volume,
-            },
+            details={"error": "Refusing reboot because device is not STANDBY.", "role": role, "volume": volume},
         )
 
-    tmsh_command = (
-        f"tmsh reboot volume {volume}"
-    )
-
-    print(
-        f"\nRebooting STANDBY device into "
-        f"target volume {volume}."
-    )
+    tmsh_command = f"tmsh reboot volume {volume}"
+    print(f"\nRebooting STANDBY device into target volume {volume}.")
     print(tmsh_command)
 
     try:
-        response = client.run_bash(
-            tmsh_command
-        )
-
+        response = client.run_bash(tmsh_command, timeout=60)
         return CheckResult(
             id=result_id,
             category="Execution",
             name=result_name,
             status="PASS",
-            details={
-                "role": role,
-                "volume": volume,
-                "tmsh": tmsh_command,
-                "command_result": (
-                    _remote_command_output(response)
-                ),
-            },
+            details={"role": role, "volume": volume, "tmsh": tmsh_command, "command_result": _remote_command_output(response)},
         )
-
     except Exception as exc:
         if _is_expected_reboot_disconnect(exc):
             return CheckResult(
@@ -1727,29 +948,14 @@ def exec_reboot_to_volume_standby(
                 category="Execution",
                 name=result_name,
                 status="PASS",
-                details={
-                    "role": role,
-                    "volume": volume,
-                    "tmsh": tmsh_command,
-                    "note": (
-                        "Disconnect during reboot "
-                        "is expected."
-                    ),
-                    "exception": str(exc),
-                },
+                details={"role": role, "volume": volume, "tmsh": tmsh_command, "note": "Disconnect during reboot is expected.", "exception": str(exc)},
             )
-
         return CheckResult(
             id=result_id,
             category="Execution",
             name=result_name,
             status="FAIL",
-            details={
-                "role": role,
-                "volume": volume,
-                "tmsh": tmsh_command,
-                "error": str(exc),
-            },
+            details={"role": role, "volume": volume, "tmsh": tmsh_command, "error": str(exc)},
         )
 
 
@@ -1759,93 +965,43 @@ def exec_wait_postboot(
     timeout_sec: int = 900,
     interval_sec: int = 15,
 ) -> CheckResult:
-    """
-    Wait until the device is reachable after reboot, is running the expected
-    version, and is back in STANDBY.
-    """
+    """Wait until the device is reachable after reboot, is running the expected version, and is back in STANDBY."""
     result_id = "VAL-POSTBOOT-001"
     result_name = "Post-boot validation"
-
     deadline = time.time() + timeout_sec
     last_error = ""
     last_seen: Dict[str, Any] = {}
 
-    print(
-        "\nWaiting for BIG-IP to return after reboot."
-    )
+    print("\nWaiting for BIG-IP to return after reboot.")
 
     while time.time() < deadline:
-        remaining = max(
-            0,
-            int(deadline - time.time()),
-        )
-
+        remaining = max(0, int(deadline - time.time()))
         try:
             version_payload = client.system_version()
             role = get_failover_role(client)
+            last_seen = {"system_version": version_payload, "role": role}
+            version_text = str(version_payload)
 
-            last_seen = {
-                "system_version": version_payload,
-                "role": role,
-            }
+            print(f"[{_now()}] Device reachable. role='{role}', remaining={remaining}s")
 
-            version_text = str(
-                version_payload
-            )
-
-            print(
-                f"[{_now()}] Device reachable. "
-                f"role='{role}', "
-                f"remaining={remaining}s"
-            )
-
-            if (
-                expect_version_contains
-                and expect_version_contains not in version_text
-            ):
-                last_error = (
-                    "Version does not match expectation yet."
-                )
-
-            elif (
-                role or ""
-            ).lower() != "standby":
-                last_error = (
-                    f"Device is not STANDBY yet. "
-                    f"Current role: {role}"
-                )
-
+            if expect_version_contains and expect_version_contains not in version_text:
+                last_error = "Version does not match expectation yet."
+            elif (role or "").lower() != "standby":
+                last_error = f"Device is not STANDBY yet. Current role: {role}"
             else:
                 return CheckResult(
                     id=result_id,
                     category="Validation",
                     name=result_name,
                     status="PASS",
-                    details={
-                        "note": (
-                            "Device is reachable with the expected "
-                            "version and standby role."
-                        ),
-                        **last_seen,
-                    },
+                    details={"note": "Device is reachable with the expected version and standby role.", **last_seen},
                 )
-
         except requests.exceptions.RequestException as exc:
             last_error = str(exc)
-
-            print(
-                f"[{_now()}] Device is not reachable yet. "
-                f"Remaining: {remaining}s"
-            )
-
+            print(f"[{_now()}] Device is not reachable yet. Remaining: {remaining}s")
         except Exception as exc:
             last_error = str(exc)
-
-            print(
-                f"[{_now()}] Waiting after reboot. "
-                f"Last error: {last_error}. "
-                f"Remaining: {remaining}s"
-            )
+            print(f"[{_now()}] Waiting after reboot. Last error: {last_error}. Remaining: {remaining}s")
 
         time.sleep(interval_sec)
 
@@ -1854,12 +1010,5 @@ def exec_wait_postboot(
         category="Validation",
         name=result_name,
         status="FAIL",
-        details={
-            "error": (
-                "Timeout waiting for post-boot readiness."
-            ),
-            "last_error": last_error,
-            "last_seen": last_seen,
-            "timeout_sec": timeout_sec,
-        },
+        details={"error": "Timeout waiting for post-boot readiness.", "last_error": last_error, "last_seen": last_seen, "timeout_sec": timeout_sec},
     )
