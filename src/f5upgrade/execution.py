@@ -416,22 +416,40 @@ def _run_bash_via_ssh(
     ssh_user: str,
     command: str,
     timeout: int,
+    control_path: Optional[str] = None,
 ) -> Dict[str, str]:
     """
-    Run a read-only bash command over a fresh, one-off SSH connection and
-    wrap stdout the same way BigIPClient.run_bash() would (as
-    'commandResult'), so callers can treat both response shapes identically.
+    Run a read-only bash command over SSH and wrap stdout the same way
+    BigIPClient.run_bash() would (as 'commandResult'), so callers can treat
+    both response shapes identically.
 
     This is used as a fallback when the REST util/bash endpoint
     (restjavad/icrd) is unresponsive, which has been observed shortly after
     heavy backup operations (UCS/QKView/ASMQKView).
+
+    If control_path points at an already-open, authenticated OpenSSH
+    ControlMaster socket (see scripts/run_upgrade_node.py's shared backup
+    SSH session), the command is multiplexed onto that existing connection
+    and does not require any new authentication or password prompt. Without
+    a control_path, a brand-new connection is opened, which may prompt for
+    a password and can therefore time out unattended.
     """
-    ssh_command = [
-        "ssh",
+    ssh_opts = [
         "-o",
         "StrictHostKeyChecking=accept-new",
         "-o",
         f"ConnectTimeout={min(timeout, 30)}",
+    ]
+    if control_path:
+        ssh_opts += [
+            "-o",
+            f"ControlPath={control_path}",
+            "-o",
+            "ControlMaster=auto",
+        ]
+    ssh_command = [
+        "ssh",
+        *ssh_opts,
         f"{ssh_user}@{ssh_host}",
         f"bash -lc {shlex.quote(command)}",
     ]
@@ -458,6 +476,7 @@ def _run_bash_with_retry(
     retry_delay: int,
     ssh_host: Optional[str] = None,
     ssh_user: Optional[str] = None,
+    ssh_control_path: Optional[str] = None,
 ) -> Any:
     """
     Run a bash command via REST, retrying on transient timeout/connection
@@ -487,6 +506,7 @@ def _run_bash_with_retry(
                 ssh_user,
                 command,
                 timeout=timeout,
+                control_path=ssh_control_path,
             )
         except Exception as ssh_exc:
             raise RuntimeError(
@@ -502,6 +522,7 @@ def check_license_dates(
     client: BigIPClient,
     image_name: str,
     ssh_user: Optional[str] = None,
+    ssh_control_path: Optional[str] = None,
 ) -> CheckResult:
     """Validate the ISO license-check date against the device service date."""
     result_id = "LIC-001"
@@ -523,6 +544,7 @@ def check_license_dates(
             retry_delay=retry_delay,
             ssh_host=ssh_host,
             ssh_user=ssh_user,
+            ssh_control_path=ssh_control_path,
         )
         version_path = next(
             (
@@ -545,6 +567,7 @@ def check_license_dates(
             retry_delay=retry_delay,
             ssh_host=ssh_host,
             ssh_user=ssh_user,
+            ssh_control_path=ssh_control_path,
         )
         iso_date = _extract_yyyymmdd(_remote_command_output(date_response))
         if not iso_date:
@@ -559,6 +582,7 @@ def check_license_dates(
             retry_delay=retry_delay,
             ssh_host=ssh_host,
             ssh_user=ssh_user,
+            ssh_control_path=ssh_control_path,
         )
         service_date = _extract_yyyymmdd(
             _remote_command_output(service_response)
@@ -596,6 +620,9 @@ def check_license_dates(
                 "timeout_seconds": timeout,
                 "max_retries": max_retries,
                 "ssh_fallback_attempted": bool(ssh_host and ssh_user),
+                "ssh_fallback_reused_existing_connection": bool(
+                    ssh_control_path
+                ),
                 "error": f"{type(exc).__name__}: {exc}",
             },
         )

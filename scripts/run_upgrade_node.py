@@ -297,27 +297,19 @@ def create_and_download_backups(
     settings: Any,
     backups_dir: Path,
     safe_host: str,
+    session: SSHSession,
 ) -> bool:
     """
     Create and download UCS, SCF, QKView, and optional ASMQKView artifacts.
+
+    The SSH session is opened and closed by the caller (main()) so that the
+    same authenticated, multiplexed connection can be reused later for the
+    LIC-001 SSH fallback without prompting for a second password.
     """
     print(
         "\n[*] Generating verified UCS, SCF, QKView, "
         "and ASMQKView backups on BIG-IP..."
     )
-
-    scp_user = getattr(
-        settings,
-        "scp_user",
-        None,
-    ) or settings.username
-
-    session = SSHSession(
-        user=scp_user,
-        host=settings.host,
-    )
-
-    session.open()
 
     try:
         hostname_result = session.run(
@@ -542,7 +534,9 @@ def create_and_download_backups(
         return True
 
     finally:
-        session.close()
+        # Session lifecycle (open/close) is owned by main(), so the same
+        # authenticated connection can be reused for later SSH fallbacks.
+        pass
 
 
 def main() -> int:
@@ -693,14 +687,32 @@ def main() -> int:
         print(f"[-] {exc}")
         return 2
 
+    scp_user = getattr(
+        settings,
+        "scp_user",
+        None,
+    ) or settings.username
+
+    # Opened here (once) and reused for both the backup artifacts and, via
+    # ssh_control_path below, for the LIC-001 SSH fallback in Stage 2 — this
+    # avoids a second, unexpected interactive password prompt mid-flow.
+    ssh_session = SSHSession(
+        user=scp_user,
+        host=settings.host,
+    )
+    ssh_session.open()
+    flow.ssh_control_path = ssh_session.control_path
+
     backups_ok = create_and_download_backups(
         client=client,
         settings=settings,
         backups_dir=backups_dir,
         safe_host=safe_host,
+        session=ssh_session,
     )
 
     if not backups_ok:
+        ssh_session.close()
         return 2
 
     # -------------------------------------------------------------------------
@@ -713,7 +725,12 @@ def main() -> int:
 
     StateCollector(client).display_ltm_health_summary()
 
-    results = flow.run()
+    try:
+        results = flow.run()
+    finally:
+        # The LIC-001 SSH fallback (if it ran) was the last consumer of the
+        # shared backup SSH session; close it now regardless of outcome.
+        ssh_session.close()
 
     report = to_report(
         results,

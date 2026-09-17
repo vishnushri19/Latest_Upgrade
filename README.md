@@ -106,7 +106,10 @@ make install
 - export LICENSE_DATE_RETRY_DELAY_SECONDS="15"  # delay between LIC-001 REST retries (default 15)
 - # LIC-001 automatically falls back to a direct SSH command (using SCP_USER)
 - # if the REST util/bash endpoint keeps timing out, which has been observed
-- # right after heavy UCS/QKView/ASMQKView backup operations.
+- # right after heavy UCS/QKView/ASMQKView backup operations. This fallback
+- # reuses the same authenticated SSH connection opened for the backup stage
+- # (run_upgrade_node.py keeps it open until Stage 2 finishes), so it does
+- # NOT prompt for a second password mid-flow.
 
 ### Run Prechecks
 Writes reports to outputs/<CRQ_NUMBER>/ in both JSON and Markdown.

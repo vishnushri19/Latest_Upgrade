@@ -37,12 +37,18 @@ class UpgradeFlow:
         client: BigIPClient,
         options: Optional[FlowOptions] = None,
         settings: Optional[Settings] = None,
+        ssh_control_path: Optional[str] = None,
     ) -> None:
         self.client = client
         self.options = options or FlowOptions()
         if settings is None:
             raise ValueError("Settings is required")
         self.settings = settings
+        # Optional path to an already-open, authenticated SSH ControlMaster
+        # socket (see scripts/run_upgrade_node.py). When set, LIC-001's SSH
+        # fallback reuses this connection instead of opening a new one,
+        # avoiding an unexpected mid-flow password prompt.
+        self.ssh_control_path = ssh_control_path
         self._preflight_results: Optional[List[CheckResult]] = None
         self._storage_result: Optional[CheckResult] = None
         self._upload_paths: List[str] = []
@@ -363,6 +369,7 @@ class UpgradeFlow:
                 getattr(self.settings, "scp_user", "")
                 or self.settings.username
             ),
+            ssh_control_path=self.ssh_control_path,
         )
         results.append(license_result)
         if self.should_stop(results):
