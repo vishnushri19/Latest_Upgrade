@@ -259,6 +259,220 @@ def check_image_present(client: BigIPClient, image_name_contains: str) -> ImageP
     )
 
 
+LICENSE_DATE_TIMEOUT_SECONDS = int(
+    os.environ.get("LICENSE_DATE_TIMEOUT_SECONDS", "60")
+)
+LICENSE_DATE_MAX_RETRIES = int(
+    os.environ.get("LICENSE_DATE_MAX_RETRIES", "2")
+)
+LICENSE_DATE_RETRY_DELAY_SECONDS = int(
+    os.environ.get("LICENSE_DATE_RETRY_DELAY_SECONDS", "15")
+)
+
+
+def _run_bash_via_ssh(
+    ssh_host: str,
+    ssh_user: str,
+    command: str,
+    timeout: int,
+    control_path: Optional[str] = None,
+) -> Dict[str, str]:
+    """
+    Run a read-only bash command over SSH and wrap stdout the same way
+    BigIPClient.run_bash() would (as 'commandResult').
+    """
+    ssh_opts = [
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        "-o",
+        f"ConnectTimeout={min(timeout, 30)}",
+    ]
+    if control_path:
+        ssh_opts += [
+            "-o",
+            f"ControlPath={control_path}",
+            "-o",
+            "ControlMaster=auto",
+        ]
+    ssh_command = [
+        "ssh",
+        *ssh_opts,
+        f"{ssh_user}@{ssh_host}",
+        f"bash -lc {shlex.quote(command)}",
+    ]
+    completed = subprocess.run(
+        ssh_command,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(
+            f"SSH command failed (exit {completed.returncode}): "
+            f"{completed.stderr.strip() or completed.stdout.strip()}"
+        )
+    return {"commandResult": completed.stdout}
+
+
+def _run_bash_with_retry(
+    client: BigIPClient,
+    command: str,
+    *,
+    timeout: int,
+    max_retries: int,
+    retry_delay: int,
+    ssh_host: Optional[str] = None,
+    ssh_user: Optional[str] = None,
+    ssh_control_path: Optional[str] = None,
+) -> Any:
+    """
+    Run a bash command via REST, retrying on transient timeout/connection
+    errors. If all REST attempts fail and SSH fallback details are provided,
+    fall back to a direct SSH command.
+    """
+    last_exc: Optional[Exception] = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            return client.run_bash(command, timeout=timeout)
+        except (
+            requests.exceptions.ReadTimeout,
+            requests.exceptions.ConnectionError,
+            requests.exceptions.Timeout,
+        ) as exc:
+            last_exc = exc
+            if attempt < max_retries:
+                time.sleep(retry_delay)
+                continue
+
+    if ssh_host and ssh_user:
+        try:
+            return _run_bash_via_ssh(
+                ssh_host,
+                ssh_user,
+                command,
+                timeout=timeout,
+                control_path=ssh_control_path,
+            )
+        except Exception as ssh_exc:
+            raise RuntimeError(
+                f"REST fallback via SSH also failed: {ssh_exc}"
+            ) from (last_exc or ssh_exc)
+
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("Unreachable: run_bash retry loop exited without a result.")
+
+
+def check_license_dates(
+    client: BigIPClient,
+    image_name: str,
+    ssh_user: Optional[str] = None,
+    ssh_control_path: Optional[str] = None,
+) -> CheckResult:
+    """Validate the ISO license-check date against the device service date."""
+    result_id = "LIC-001"
+    result_name = "ISO and service-check dates validated"
+    remote_iso = f"/shared/images/{image_name}"
+    timeout = LICENSE_DATE_TIMEOUT_SECONDS
+    max_retries = LICENSE_DATE_MAX_RETRIES
+    retry_delay = LICENSE_DATE_RETRY_DELAY_SECONDS
+    ssh_host = client.host if ssh_user else None
+    stage = "version_date lookup"
+
+    try:
+        version_response = _run_bash_with_retry(
+            client,
+            "isoinfo -f -R -i "
+            f"{_shell_quote(remote_iso)} | grep -m1 'version_date'",
+            timeout=timeout,
+            max_retries=max_retries,
+            retry_delay=retry_delay,
+            ssh_host=ssh_host,
+            ssh_user=ssh_user,
+            ssh_control_path=ssh_control_path,
+        )
+        version_path = next(
+            (
+                line.strip()
+                for line in _remote_command_output(version_response).splitlines()
+                if "version_date" in line
+            ),
+            "",
+        )
+        if not version_path:
+            raise ValueError("ISO version_date entry was not found.")
+
+        stage = "ISO license-check date read"
+        date_response = _run_bash_with_retry(
+            client,
+            "isoinfo -R -i "
+            f"{_shell_quote(remote_iso)} -x {_shell_quote(version_path)}",
+            timeout=timeout,
+            max_retries=max_retries,
+            retry_delay=retry_delay,
+            ssh_host=ssh_host,
+            ssh_user=ssh_user,
+            ssh_control_path=ssh_control_path,
+        )
+        iso_date = _extract_yyyymmdd(_remote_command_output(date_response))
+        if not iso_date:
+            raise ValueError("ISO license-check date was not found.")
+
+        stage = "service-check date read"
+        service_response = _run_bash_with_retry(
+            client,
+            "grep -F 'Service check date' /config/bigip.license",
+            timeout=timeout,
+            max_retries=max_retries,
+            retry_delay=retry_delay,
+            ssh_host=ssh_host,
+            ssh_user=ssh_user,
+            ssh_control_path=ssh_control_path,
+        )
+        service_date = _extract_yyyymmdd(
+            _remote_command_output(service_response)
+        )
+        if not service_date:
+            raise ValueError("BIG-IP service-check date was not found.")
+
+        reactivation_required = service_date < iso_date
+        return CheckResult(
+            id=result_id,
+            category="License and Platform Readiness",
+            name=result_name,
+            status="FAIL" if reactivation_required else "PASS",
+            details={
+                "image": image_name,
+                "iso_license_check_date": iso_date,
+                "service_check_date": service_date,
+                "license_reactivation_required": reactivation_required,
+                "error": (
+                    "License reactivation is required before upgrade."
+                    if reactivation_required
+                    else ""
+                ),
+            },
+        )
+    except Exception as exc:
+        return CheckResult(
+            id=result_id,
+            category="License and Platform Readiness",
+            name=result_name,
+            status="FAIL",
+            details={
+                "image": image_name,
+                "stage": stage,
+                "timeout_seconds": timeout,
+                "max_retries": max_retries,
+                "ssh_fallback_attempted": bool(ssh_host and ssh_user),
+                "ssh_fallback_reused_existing_connection": bool(
+                    ssh_control_path
+                ),
+                "error": f"{type(exc).__name__}: {exc}",
+            },
+        )
+
+
 def _extract_yyyymmdd(output: str) -> str:
     match = re.search(r"(?<!\d)(20\d{6})(?!\d)", output or "")
     return match.group(1) if match else ""
