@@ -14,7 +14,7 @@ class Settings:
     username: str
     password: str
     verify_tls: bool = False
-    timeout: int = 20
+    timeout: int = 60
     crq_number: str = ""
 
     # Upgrade intent
@@ -93,7 +93,7 @@ def load_settings() -> Settings:
     # Optional / with defaults
     verify_tls = os.getenv("VERIFY_TLS", "0").strip().lower() in ("1", "true", "yes")
 
-    timeout_raw = os.getenv("BIGIP_TIMEOUT", "20").strip() or "20"
+    timeout_raw = os.getenv("BIGIP_TIMEOUT", "60").strip() or "60"
     try:
         timeout = int(timeout_raw)
     except ValueError:
