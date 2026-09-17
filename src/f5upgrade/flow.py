@@ -359,6 +359,10 @@ class UpgradeFlow:
         license_result = check_license_dates(
             self.client,
             license_image_name,
+            ssh_user=(
+                getattr(self.settings, "scp_user", "")
+                or self.settings.username
+            ),
         )
         results.append(license_result)
         if self.should_stop(results):

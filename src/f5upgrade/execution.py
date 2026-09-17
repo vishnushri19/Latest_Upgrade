@@ -401,14 +401,52 @@ def check_image_present(
 
 
 LICENSE_DATE_TIMEOUT_SECONDS = int(
-    os.environ.get("LICENSE_DATE_TIMEOUT_SECONDS", "180")
+    os.environ.get("LICENSE_DATE_TIMEOUT_SECONDS", "60")
 )
 LICENSE_DATE_MAX_RETRIES = int(
-    os.environ.get("LICENSE_DATE_MAX_RETRIES", "3")
+    os.environ.get("LICENSE_DATE_MAX_RETRIES", "2")
 )
 LICENSE_DATE_RETRY_DELAY_SECONDS = int(
-    os.environ.get("LICENSE_DATE_RETRY_DELAY_SECONDS", "10")
+    os.environ.get("LICENSE_DATE_RETRY_DELAY_SECONDS", "15")
 )
+
+
+def _run_bash_via_ssh(
+    ssh_host: str,
+    ssh_user: str,
+    command: str,
+    timeout: int,
+) -> Dict[str, str]:
+    """
+    Run a read-only bash command over a fresh, one-off SSH connection and
+    wrap stdout the same way BigIPClient.run_bash() would (as
+    'commandResult'), so callers can treat both response shapes identically.
+
+    This is used as a fallback when the REST util/bash endpoint
+    (restjavad/icrd) is unresponsive, which has been observed shortly after
+    heavy backup operations (UCS/QKView/ASMQKView).
+    """
+    ssh_command = [
+        "ssh",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        "-o",
+        f"ConnectTimeout={min(timeout, 30)}",
+        f"{ssh_user}@{ssh_host}",
+        f"bash -lc {shlex.quote(command)}",
+    ]
+    completed = subprocess.run(
+        ssh_command,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(
+            f"SSH command failed (exit {completed.returncode}): "
+            f"{completed.stderr.strip() or completed.stdout.strip()}"
+        )
+    return {"commandResult": completed.stdout}
 
 
 def _run_bash_with_retry(
@@ -418,8 +456,16 @@ def _run_bash_with_retry(
     timeout: int,
     max_retries: int,
     retry_delay: int,
+    ssh_host: Optional[str] = None,
+    ssh_user: Optional[str] = None,
 ) -> Any:
-    """Run a bash command, retrying on transient timeout/connection errors."""
+    """
+    Run a bash command via REST, retrying on transient timeout/connection
+    errors. If all REST attempts fail and SSH fallback details are provided,
+    fall back to a direct SSH command so a REST daemon hiccup (for example,
+    restjavad still recovering right after heavy backup operations) does not
+    fail the check outright.
+    """
     last_exc: Optional[Exception] = None
     for attempt in range(1, max_retries + 1):
         try:
@@ -433,7 +479,20 @@ def _run_bash_with_retry(
             if attempt < max_retries:
                 time.sleep(retry_delay)
                 continue
-            raise
+
+    if ssh_host and ssh_user:
+        try:
+            return _run_bash_via_ssh(
+                ssh_host,
+                ssh_user,
+                command,
+                timeout=timeout,
+            )
+        except Exception as ssh_exc:
+            raise RuntimeError(
+                f"REST fallback via SSH also failed: {ssh_exc}"
+            ) from (last_exc or ssh_exc)
+
     if last_exc:
         raise last_exc
     raise RuntimeError("Unreachable: run_bash retry loop exited without a result.")
@@ -442,6 +501,7 @@ def _run_bash_with_retry(
 def check_license_dates(
     client: BigIPClient,
     image_name: str,
+    ssh_user: Optional[str] = None,
 ) -> CheckResult:
     """Validate the ISO license-check date against the device service date."""
     result_id = "LIC-001"
@@ -450,6 +510,7 @@ def check_license_dates(
     timeout = LICENSE_DATE_TIMEOUT_SECONDS
     max_retries = LICENSE_DATE_MAX_RETRIES
     retry_delay = LICENSE_DATE_RETRY_DELAY_SECONDS
+    ssh_host = client.host if ssh_user else None
     stage = "version_date lookup"
 
     try:
@@ -460,6 +521,8 @@ def check_license_dates(
             timeout=timeout,
             max_retries=max_retries,
             retry_delay=retry_delay,
+            ssh_host=ssh_host,
+            ssh_user=ssh_user,
         )
         version_path = next(
             (
@@ -480,6 +543,8 @@ def check_license_dates(
             timeout=timeout,
             max_retries=max_retries,
             retry_delay=retry_delay,
+            ssh_host=ssh_host,
+            ssh_user=ssh_user,
         )
         iso_date = _extract_yyyymmdd(_remote_command_output(date_response))
         if not iso_date:
@@ -492,6 +557,8 @@ def check_license_dates(
             timeout=timeout,
             max_retries=max_retries,
             retry_delay=retry_delay,
+            ssh_host=ssh_host,
+            ssh_user=ssh_user,
         )
         service_date = _extract_yyyymmdd(
             _remote_command_output(service_response)
@@ -528,6 +595,7 @@ def check_license_dates(
                 "stage": stage,
                 "timeout_seconds": timeout,
                 "max_retries": max_retries,
+                "ssh_fallback_attempted": bool(ssh_host and ssh_user),
                 "error": f"{type(exc).__name__}: {exc}",
             },
         )

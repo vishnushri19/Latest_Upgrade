@@ -101,9 +101,12 @@ make install
 - export HOTFIX_ISO_LOCAL_PATH="/path/to/Hotfix-BIGIP-16.1.4.1.0.50.5-ENG.iso"
 - export SCP_USER="admin"  
 - export BACKUP_STAGE_WAIT_SECONDS="60"  # pause between UCS/SCF/QKView/ASMQKView stages (default 60)
-- export LICENSE_DATE_TIMEOUT_SECONDS="180"  # per-command timeout for LIC-001 date checks (default 180)
-- export LICENSE_DATE_MAX_RETRIES="3"        # retry attempts for transient LIC-001 timeouts (default 3)
-- export LICENSE_DATE_RETRY_DELAY_SECONDS="10"  # delay between LIC-001 retries (default 10)
+- export LICENSE_DATE_TIMEOUT_SECONDS="60"   # per-command REST timeout for LIC-001 date checks (default 60)
+- export LICENSE_DATE_MAX_RETRIES="2"         # REST retry attempts before falling back to SSH (default 2)
+- export LICENSE_DATE_RETRY_DELAY_SECONDS="15"  # delay between LIC-001 REST retries (default 15)
+- # LIC-001 automatically falls back to a direct SSH command (using SCP_USER)
+- # if the REST util/bash endpoint keeps timing out, which has been observed
+- # right after heavy UCS/QKView/ASMQKView backup operations.
 
 ### Run Prechecks
 Writes reports to outputs/<CRQ_NUMBER>/ in both JSON and Markdown.
