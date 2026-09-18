@@ -1,0 +1,224 @@
+from __future__ import annotations
+
+import sys
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
+
+import requests
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SRC_ROOT = PROJECT_ROOT / "src"
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
+
+from f5upgrade.execution import (  # noqa: E402
+    VolumeState,
+    _execution_role_allowed,
+    exec_install_standby,
+)
+from f5upgrade.flow import UpgradeFlow  # noqa: E402
+
+
+def missing_volume(volume: str = "HD1.2") -> VolumeState:
+    return VolumeState(
+        found=False,
+        volume=volume,
+        source="test",
+        error="not found",
+    )
+
+
+def installing_volume(volume: str = "HD1.2") -> VolumeState:
+    return VolumeState(
+        found=True,
+        volume=volume,
+        version="21.0.0",
+        status="installing 1 pct",
+        build="0.0.1",
+        source="test",
+        raw="HD1.2 BIG-IP 21.0.0 0.0.1 no installing 1 pct",
+    )
+
+
+class FakeInstallClient:
+    host = "192.0.2.10"
+
+    def __init__(self, rest_result=None, rest_error=None):
+        self.rest_result = rest_result or {"commandResult": ""}
+        self.rest_error = rest_error
+        self.run_bash_once_calls = 0
+
+    def run_bash_once(self, command: str, timeout: int):
+        self.run_bash_once_calls += 1
+        if self.rest_error is not None:
+            raise self.rest_error
+        return self.rest_result
+
+
+class ExecutionRoleTests(unittest.TestCase):
+    def test_ha_standby_is_allowed(self):
+        self.assertTrue(_execution_role_allowed("standby", False))
+
+    def test_ha_active_is_blocked(self):
+        self.assertFalse(_execution_role_allowed("active", False))
+
+    def test_verified_standalone_active_is_allowed(self):
+        self.assertTrue(_execution_role_allowed("active", True))
+
+    def test_unknown_role_is_blocked(self):
+        self.assertFalse(_execution_role_allowed("", False))
+        self.assertFalse(_execution_role_allowed("unknown", True))
+
+
+class StandaloneTopologyTests(unittest.TestCase):
+    def test_zero_device_inventory_does_not_enable_standalone(self):
+        client = Mock()
+        client.host = "192.0.2.20"
+        client.system_version.return_value = {"version": "17.1.2.1"}
+        client.devices.return_value = {"items": []}
+
+        settings = SimpleNamespace(
+            target_image_contains="21.0.0",
+            username="admin",
+        )
+        flow = UpgradeFlow(client=client, settings=settings)
+
+        with (
+            patch("f5upgrade.flow.get_failover_role", return_value="active"),
+            patch("f5upgrade.flow.run_prechecks", return_value=[]),
+        ):
+            results = flow.preflight()
+
+        self.assertFalse(flow._is_standalone)
+        result_ids = {result.id for result in results}
+        self.assertIn("FLOW-STANDALONE-001", result_ids)
+        self.assertIn("FLOW-SKIP-002", result_ids)
+
+
+class InstallSubmissionTests(unittest.TestCase):
+    image = "BIGIP-21.0.0-0.0.1.iso"
+    volume = "HD1.2"
+
+    def call_install(self, client, **kwargs):
+        return exec_install_standby(
+            client,
+            self.image,
+            self.volume,
+            ssh_user=kwargs.get("ssh_user"),
+            ssh_control_path=kwargs.get("ssh_control_path"),
+            allow_standalone=kwargs.get("allow_standalone", False),
+        )
+
+    def test_successful_rest_submission_occurs_once(self):
+        client = FakeInstallClient()
+        with (
+            patch("f5upgrade.execution.get_failover_role", return_value="standby"),
+            patch("f5upgrade.execution._get_volume_state", return_value=missing_volume()),
+        ):
+            result = self.call_install(client)
+
+        self.assertEqual("PASS", result.status)
+        self.assertEqual(1, client.run_bash_once_calls)
+        self.assertEqual("rest-single-attempt", result.details["submission_method"])
+
+    def test_verified_standalone_can_submit_once(self):
+        client = FakeInstallClient()
+        with (
+            patch("f5upgrade.execution.get_failover_role", return_value="active"),
+            patch("f5upgrade.execution._get_volume_state", return_value=missing_volume()),
+        ):
+            result = self.call_install(client, allow_standalone=True)
+
+        self.assertEqual("PASS", result.status)
+        self.assertEqual(1, client.run_bash_once_calls)
+
+    def test_ha_active_is_refused_before_submission(self):
+        client = FakeInstallClient()
+        with patch(
+            "f5upgrade.execution.get_failover_role",
+            return_value="active",
+        ):
+            result = self.call_install(client)
+
+        self.assertEqual("FAIL", result.status)
+        self.assertEqual(0, client.run_bash_once_calls)
+
+    def test_timeout_with_installing_volume_does_not_submit_over_ssh(self):
+        client = FakeInstallClient(
+            rest_error=requests.exceptions.ReadTimeout("ambiguous timeout")
+        )
+        states = [missing_volume(), installing_volume()]
+
+        with (
+            patch("f5upgrade.execution.get_failover_role", return_value="standby"),
+            patch("f5upgrade.execution._get_volume_state", side_effect=states),
+            patch("f5upgrade.execution._run_bash_via_ssh") as ssh_submit,
+            patch("f5upgrade.execution.time.sleep"),
+        ):
+            result = self.call_install(
+                client,
+                ssh_user="admin",
+                ssh_control_path="control.sock",
+            )
+
+        self.assertEqual("PASS", result.status)
+        self.assertEqual(1, client.run_bash_once_calls)
+        ssh_submit.assert_not_called()
+        self.assertFalse(result.details["automatic_resubmission"])
+
+    def test_timeout_without_started_install_submits_ssh_once(self):
+        client = FakeInstallClient(
+            rest_error=requests.exceptions.ReadTimeout("ambiguous timeout")
+        )
+
+        with (
+            patch("f5upgrade.execution.get_failover_role", return_value="standby"),
+            patch("f5upgrade.execution._get_volume_state", return_value=missing_volume()),
+            patch(
+                "f5upgrade.execution._get_volume_state_via_ssh",
+                return_value=missing_volume(),
+            ),
+            patch(
+                "f5upgrade.execution._run_bash_via_ssh",
+                return_value={"commandResult": ""},
+            ) as ssh_submit,
+            patch("f5upgrade.execution.time.sleep"),
+        ):
+            result = self.call_install(
+                client,
+                ssh_user="admin",
+                ssh_control_path="control.sock",
+            )
+
+        self.assertEqual("PASS", result.status)
+        self.assertEqual(1, client.run_bash_once_calls)
+        self.assertEqual(1, ssh_submit.call_count)
+        self.assertEqual(
+            "ssh-after-state-verification",
+            result.details["submission_method"],
+        )
+
+    def test_timeout_without_ssh_fails_without_resubmission(self):
+        client = FakeInstallClient(
+            rest_error=requests.exceptions.ReadTimeout("ambiguous timeout")
+        )
+
+        with (
+            patch("f5upgrade.execution.get_failover_role", return_value="standby"),
+            patch("f5upgrade.execution._get_volume_state", return_value=missing_volume()),
+            patch("f5upgrade.execution._run_bash_via_ssh") as ssh_submit,
+            patch("f5upgrade.execution.time.sleep"),
+        ):
+            result = self.call_install(client)
+
+        self.assertEqual("FAIL", result.status)
+        self.assertEqual(1, client.run_bash_once_calls)
+        ssh_submit.assert_not_called()
+        self.assertFalse(result.details["automatic_resubmission"])
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
