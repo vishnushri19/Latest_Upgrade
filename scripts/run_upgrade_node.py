@@ -696,9 +696,16 @@ def main() -> int:
     # Opened here (once) and reused for both the backup artifacts and, via
     # ssh_control_path below, for the LIC-001 SSH fallback in Stage 2 — this
     # avoids a second, unexpected interactive password prompt mid-flow.
+    # The password already collected for the REST client (settings.password)
+    # is reused for this SSH connection too (only if scp_user matches the
+    # REST username), so the operator is prompted for a password only once
+    # for the whole run instead of once per connection type.
     ssh_session = SSHSession(
         user=scp_user,
         host=settings.host,
+        password=(
+            settings.password if scp_user == settings.username else None
+        ),
     )
     ssh_session.open()
     flow.ssh_control_path = ssh_session.control_path

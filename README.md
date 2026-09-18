@@ -111,6 +111,16 @@ make install
 - # (run_upgrade_node.py keeps it open until Stage 2 finishes), so it does
 - # NOT prompt for a second password mid-flow.
 
+### Single password prompt for the entire run
+When SCP_USER matches BIGIP_USER (the default), the shared SSH connection used
+for UCS/SCF/QKView/ASMQKView backups reuses the password already collected for
+the REST client (either from `BIGIP_PASS` or the initial `getpass` prompt) via
+SSH's `SSH_ASKPASS` mechanism. This means you are prompted for the BIG-IP
+password only **once**, at the very start of the run, and never again until
+the whole flow completes. If `SCP_USER` is set to a *different* account than
+`BIGIP_USER`, the tool cannot safely reuse the REST password and will still
+prompt interactively once for that SSH connection.
+
 ### Run Prechecks
 Writes reports to outputs/<CRQ_NUMBER>/ in both JSON and Markdown.
 make prechecks

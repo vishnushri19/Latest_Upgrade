@@ -3,7 +3,9 @@ from __future__ import annotations
 import os
 import posixpath
 import shlex
+import stat
 import subprocess
+import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
@@ -98,6 +100,7 @@ class SSHSession:
         user: str,
         host: str,
         persist_minutes: int = 30,
+        password: Optional[str] = None,
     ) -> None:
         self.user = user
         self.host = host
@@ -109,6 +112,11 @@ class SSHSession:
 
         self.persist = f"{persist_minutes}m"
         self.is_open = False
+        # When provided, this password (already collected once via the
+        # BIG-IP REST password prompt) is used to authenticate the shared
+        # SSH master connection non-interactively, via SSH_ASKPASS, so the
+        # operator is never prompted a second time.
+        self.password = password
 
     def _base_opts(self) -> List[str]:
         """Options shared by SSH and SCP."""
@@ -121,13 +129,55 @@ class SSHSession:
             "StrictHostKeyChecking=accept-new",
         ]
 
+    def _open_with_askpass(self, command: List[str]) -> bool:
+        """
+        Attempt to open the master connection non-interactively by feeding
+        the already-collected password through SSH_ASKPASS. Requires
+        OpenSSH 8.4+ (SSH_ASKPASS_REQUIRE=force) on the client. Returns
+        False (without raising) if this mechanism is unavailable, so the
+        caller can fall back to a normal interactive prompt.
+        """
+        if not self.password:
+            return False
+
+        askpass_dir = tempfile.mkdtemp(prefix="f5upgrade-askpass-")
+        askpass_path = os.path.join(askpass_dir, "askpass.sh")
+        try:
+            escaped_password = self.password.replace("'", "'\\''")
+            with open(askpass_path, "w", encoding="utf-8") as handle:
+                handle.write("#!/bin/sh\n")
+                handle.write(f"printf '%s' '{escaped_password}'\n")
+            os.chmod(askpass_path, stat.S_IRWXU)
+
+            env = dict(os.environ)
+            env["SSH_ASKPASS"] = askpass_path
+            env["SSH_ASKPASS_REQUIRE"] = "force"
+            # Some OpenSSH versions still check for a DISPLAY value before
+            # invoking SSH_ASKPASS, even with SSH_ASKPASS_REQUIRE=force.
+            env.setdefault("DISPLAY", ":0")
+
+            completed = subprocess.run(
+                command,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+            return completed.returncode == 0
+        except Exception:
+            return False
+        finally:
+            try:
+                os.remove(askpass_path)
+            except OSError:
+                pass
+            try:
+                os.rmdir(askpass_dir)
+            except OSError:
+                pass
+
     def open(self) -> None:
         """Open the shared SSH master connection."""
-        print(
-            "\nOpening shared SSH connection. "
-            "You should be prompted for the password once."
-        )
-
         command = [
             "ssh",
             "-o",
@@ -141,6 +191,19 @@ class SSHSession:
             self.target,
             f"bash -lc {shlex.quote('true')}",
         ]
+
+        if self.password and self._open_with_askpass(command):
+            self.is_open = True
+            print(
+                "\n[+] Shared SSH connection established using the "
+                "already-provided password (no second prompt)."
+            )
+            return
+
+        print(
+            "\nOpening shared SSH connection. "
+            "You should be prompted for the password once."
+        )
 
         try:
             completed = subprocess.run(command)
