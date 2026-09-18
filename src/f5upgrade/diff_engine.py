@@ -453,6 +453,125 @@ class DiffEngine:
             )
         return lines
 
+    def generate_cli_summary_table(self, diff_result: Dict[str, Any]) -> str:
+        """
+        Render a compact plain-text table of the same checks shown in the
+        markdown report's BGP/Certificate/FIPS/Interfaces sections, for
+        printing directly to the console at the end of a run.
+        """
+        pre_health = diff_result.get("health_summary", {}).get("pre", {})
+        post_health = diff_result.get("health_summary", {}).get("post", {})
+
+        bgp_pre = diff_result.get("bgp_inventory", {}).get("pre", {})
+        bgp_post = diff_result.get("bgp_inventory", {}).get("post", {})
+
+        crypto_pre = diff_result.get("crypto_inventory", {}).get("pre", {})
+        crypto_post = diff_result.get("crypto_inventory", {}).get("post", {})
+
+        rows: List[tuple] = []
+
+        bgp_before = "Enabled" if bgp_pre.get("enabled") else "Disabled"
+        bgp_after = "Enabled" if bgp_post.get("enabled") else "Disabled"
+        rows.append(
+            (
+                "BGP route domain 0",
+                bgp_before,
+                bgp_after,
+                self._comparison_result(bgp_before, bgp_after),
+            )
+        )
+
+        pre_neighbors = bgp_pre.get("neighbors", [])
+        post_neighbors = bgp_post.get("neighbors", [])
+        rows.append(
+            (
+                "BGP neighbors",
+                str(len(pre_neighbors)),
+                str(len(post_neighbors)),
+                self._comparison_result(len(pre_neighbors), len(post_neighbors)),
+            )
+        )
+
+        pre_routes = bgp_pre.get("advertised_routes", {})
+        post_routes = bgp_post.get("advertised_routes", {})
+        common_neighbors = set(pre_routes) & set(post_routes)
+        routes_changed = any(
+            pre_routes.get(neighbor) != post_routes.get(neighbor)
+            for neighbor in common_neighbors
+        ) or set(pre_routes) != set(post_routes)
+        routes_label = "Changed" if routes_changed else "No change"
+        rows.append(
+            (
+                "Advertised routes",
+                routes_label,
+                routes_label,
+                "REVIEW" if routes_changed else "PASS",
+            )
+        )
+
+        pre_iface = self._interface_state(pre_health)
+        post_iface = self._interface_state(post_health)
+        rows.append(
+            (
+                "Interfaces up",
+                pre_iface,
+                post_iface,
+                self._comparison_result(pre_iface, post_iface),
+            )
+        )
+
+        pre_certs = crypto_pre.get("non_fips", {}).get("ssl_cert_count")
+        post_certs = crypto_post.get("non_fips", {}).get("ssl_cert_count")
+        rows.append(
+            (
+                "Certificates",
+                "N/A" if pre_certs is None else str(pre_certs),
+                "N/A" if post_certs is None else str(post_certs),
+                self._comparison_result(pre_certs, post_certs),
+            )
+        )
+
+        def fips_label(inventory: Dict[str, Any]) -> str:
+            fips = inventory.get("fips", {})
+            raw = str(fips.get("raw_output", "")).lower()
+            if "not licensed" in raw:
+                return "Not licensed"
+            private = fips.get("private_key_count")
+            public = fips.get("public_key_count")
+            if private is None and public is None:
+                return "N/A"
+            return f"{private or 0} priv / {public or 0} pub"
+
+        pre_fips = fips_label(crypto_pre)
+        post_fips = fips_label(crypto_post)
+        rows.append(
+            (
+                "FIPS",
+                pre_fips,
+                post_fips,
+                self._comparison_result(pre_fips, post_fips),
+            )
+        )
+
+        headers = ("Check", "Before", "After", "Result")
+        widths = [
+            max(len(str(row[i])) for row in ([headers] + rows))
+            for i in range(4)
+        ]
+
+        def format_row(row: tuple) -> str:
+            return "  ".join(
+                str(value).ljust(widths[i]) for i, value in enumerate(row)
+            )
+
+        separator = "  ".join("-" * width for width in widths)
+        lines = [
+            format_row(headers),
+            separator,
+        ]
+        lines.extend(format_row(row) for row in rows)
+        return "\n".join(lines)
+
     @staticmethod
     def _crypto_markdown(
         pre: Dict[str, Any],

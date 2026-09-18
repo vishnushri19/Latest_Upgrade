@@ -918,6 +918,10 @@ def main() -> int:
         f"[+] Wrote Diff Report: {diff_md}"
     )
 
+    print(
+        "\n" + engine.generate_cli_summary_table(diff_results) + "\n"
+    )
+
     summary = diff_results.get(
         "summary",
         {},

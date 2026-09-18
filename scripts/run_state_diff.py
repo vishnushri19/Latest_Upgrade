@@ -106,6 +106,8 @@ def run_diff(
     print(f"\n[+] Wrote Diff Report (Markdown): {diff_md_path}")
     print(f"[+] Wrote Diff Report (JSON):     {diff_json_path}")
 
+    print("\n" + engine.generate_cli_summary_table(diff_results) + "\n")
+
     # Print summary to console
     summary = diff_results.get("summary", {})
     crit = summary.get("critical_regressions", 0)
