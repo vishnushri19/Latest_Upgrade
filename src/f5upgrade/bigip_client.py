@@ -97,12 +97,48 @@ class BigIPClient:
         resp = self._request_with_retry("GET", url, timeout=timeout)
         return resp.json()
 
+    def _request_once(
+        self,
+        method: str,
+        url: str,
+        timeout: Optional[int] = None,
+        **kwargs: Any,
+    ) -> requests.Response:
+        """Execute exactly one HTTP request without automatic retries.
+
+        This is required for non-idempotent operations. If a request times
+        out after BIG-IP accepted it, repeating it could submit the same
+        destructive command more than once.
+        """
+        eff_timeout = timeout if timeout is not None else self.timeout
+        resp = requests.request(
+            method=method,
+            url=url,
+            auth=self.auth,
+            verify=self.verify_tls,
+            timeout=eff_timeout,
+            **kwargs,
+        )
+        resp.raise_for_status()
+        return resp
+
     def post(self, path: str, payload: Dict[str, Any], timeout: Optional[int] = None) -> Dict[str, Any]:
         """
         Perform a POST against an iControl REST path (starting with '/mgmt/...').
         """
         url = self.base_url + path
         resp = self._request_with_retry("POST", url, timeout=timeout, json=payload)
+        return resp.json()
+
+    def post_once(
+        self,
+        path: str,
+        payload: Dict[str, Any],
+        timeout: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Perform one POST attempt without retrying an unknown outcome."""
+        url = self.base_url + path
+        resp = self._request_once("POST", url, timeout=timeout, json=payload)
         return resp.json()
 
     def patch(self, path: str, payload: Dict[str, Any], timeout: Optional[int] = None) -> Dict[str, Any]:
@@ -126,6 +162,18 @@ class BigIPClient:
             "utilCmdArgs": f"-c '{command}'",
         }
         return self.post("/mgmt/tm/util/bash", payload, timeout=timeout)
+
+    def run_bash_once(
+        self,
+        command: str,
+        timeout: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Execute a bash command through exactly one iControl POST."""
+        payload = {
+            "command": "run",
+            "utilCmdArgs": f"-c '{command}'",
+        }
+        return self.post_once("/mgmt/tm/util/bash", payload, timeout=timeout)
 
     # ---------------- Discovery ----------------
 

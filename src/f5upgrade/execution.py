@@ -196,12 +196,12 @@ IMAGE_CHECK_TIMEOUT_SECONDS = 60
 IMAGE_CHECK_MAX_RETRIES = 3
 IMAGE_CHECK_RETRY_DELAY_SECONDS = 10
 
-# Install-submission uses the same fixed internal retry settings as the
-# image check, so a transient icrd/REST outage does not fail the install
-# step outright when SSH fallback can complete it instead.
+# Install submission is intentionally single-attempt. A timeout can occur
+# after BIG-IP accepted the command, so blind retries could submit the same
+# non-idempotent install multiple times.
 INSTALL_SUBMIT_TIMEOUT_SECONDS = 120
-INSTALL_SUBMIT_MAX_RETRIES = 3
-INSTALL_SUBMIT_RETRY_DELAY_SECONDS = 10
+INSTALL_STATE_VERIFY_ATTEMPTS = 3
+INSTALL_STATE_VERIFY_DELAY_SECONDS = 10
 
 
 def check_image_present(
@@ -410,6 +410,79 @@ def _run_bash_with_retry(
     raise RuntimeError("Unreachable: run_bash retry loop exited without a result.")
 
 
+def _is_ambiguous_submission_error(error: Exception) -> bool:
+    """Return True when BIG-IP may have accepted a timed-out REST request."""
+    if isinstance(
+        error,
+        (
+            requests.exceptions.Timeout,
+            requests.exceptions.ConnectionError,
+        ),
+    ):
+        return True
+    if isinstance(error, requests.exceptions.HTTPError):
+        response = getattr(error, "response", None)
+        return getattr(response, "status_code", None) in (502, 503, 504)
+    return False
+
+
+def _get_volume_state_via_ssh(
+    host: str,
+    user: str,
+    control_path: Optional[str],
+    volume: str,
+) -> VolumeState:
+    """Read target-volume state through the authenticated SSH connection."""
+    response = _run_bash_via_ssh(
+        host,
+        user,
+        "tmsh show sys software status",
+        timeout=30,
+        control_path=control_path,
+    )
+    return _parse_volume_from_tmsh_status(
+        _remote_command_output(response),
+        volume,
+    )
+
+
+def _volume_indicates_install_started(
+    before: VolumeState,
+    after: VolumeState,
+    expected_version: str,
+) -> bool:
+    """Determine whether state changed enough to prove submission started."""
+    if not after.found:
+        return False
+
+    status = after.status.lower()
+    in_progress = any(
+        marker in status
+        for marker in (
+            "installing",
+            "testing",
+            "copying",
+            "pending",
+            "waiting",
+            "validating",
+        )
+    )
+    version_matches = bool(
+        expected_version and expected_version in after.version
+    )
+
+    if not before.found:
+        return in_progress or version_matches
+
+    state_changed = (
+        before.version != after.version
+        or before.status != after.status
+        or before.build != after.build
+        or before.raw != after.raw
+    )
+    return state_changed and (in_progress or version_matches)
+
+
 def check_license_dates(
     client: BigIPClient,
     image_name: str,
@@ -529,6 +602,21 @@ def _is_hotfix_image(image_name: str) -> bool:
     return os.path.basename(image_name).lower().startswith("hotfix-bigip-")
 
 
+def _execution_role_allowed(role: str, allow_standalone: bool) -> bool:
+    """Allow STANDBY, or ACTIVE only for a topology-verified standalone."""
+    normalized_role = (role or "").strip().lower()
+    return normalized_role == "standby" or (
+        allow_standalone and normalized_role == "active"
+    )
+
+
+def _execution_mode(role: str, allow_standalone: bool) -> str:
+    """Return a human-readable execution mode for evidence and messages."""
+    if allow_standalone and (role or "").strip().lower() == "active":
+        return "standalone"
+    return "ha-standby"
+
+
 def prepare_install_storage(
     client: BigIPClient,
     target_volume: str,
@@ -536,6 +624,7 @@ def prepare_install_storage(
     require_upload_space: bool,
     expected_image_contains: str = "",
     skip_iso_cleanup: bool = False,
+    allow_standalone: bool = False,
 ) -> CheckResult:
     """Display storage state and safely prepare an inactive target volume."""
     result_id = "EXEC-STORAGE-001"
@@ -553,14 +642,24 @@ def prepare_install_storage(
             details={"error": f"Could not determine failover role: {exc}"},
         )
 
-    if role != "standby":
+    if not _execution_role_allowed(role, allow_standalone):
         return CheckResult(
             id=result_id,
             category="Execution Readiness",
             name=result_name,
             status="FAIL",
-            details={"error": "Storage preparation requires a STANDBY device.", "role": role},
+            details={
+                "error": (
+                    "Storage preparation requires an HA STANDBY device or "
+                    "a topology-verified standalone device."
+                ),
+                "role": role,
+                "allow_standalone": allow_standalone,
+            },
         )
+
+    details["role"] = role
+    details["execution_mode"] = _execution_mode(role, allow_standalone)
 
     if skip_iso_cleanup:
         print(
@@ -767,19 +866,29 @@ def exec_upload_iso_standby(
     host: str,
     scp_user: str,
     iso_local_path: str,
+    *,
+    allow_standalone: bool = False,
+    ssh_control_path: Optional[str] = None,
 ) -> CheckResult:
     """Upload the ISO to /shared/images on a standby BIG-IP."""
     result_id = "EXEC-UPLOAD-ISO-001"
     result_name = "Upload ISO to /shared/images (standby only)"
 
     role = (get_failover_role(client) or "").lower()
-    if role != "standby":
+    if not _execution_role_allowed(role, allow_standalone):
         return CheckResult(
             id=result_id,
             category="Execution",
             name=result_name,
             status="FAIL",
-            details={"error": "Refusing upload because device is not STANDBY.", "role": role},
+            details={
+                "error": (
+                    "Refusing upload because the device is neither HA "
+                    "STANDBY nor a topology-verified standalone device."
+                ),
+                "role": role,
+                "allow_standalone": allow_standalone,
+            },
         )
 
     if not iso_local_path:
@@ -807,7 +916,19 @@ def exec_upload_iso_standby(
     local_size = os.path.getsize(iso_local_path)
     local_sha256 = _sha256_file(iso_local_path)
 
-    command = ["scp", "-O", iso_local_path, destination]
+    command = ["scp", "-O"]
+    if ssh_control_path:
+        command.extend(
+            [
+                "-o",
+                f"ControlPath={ssh_control_path}",
+                "-o",
+                "ControlMaster=auto",
+                "-o",
+                "BatchMode=yes",
+            ]
+        )
+    command.extend([iso_local_path, destination])
 
     print("\nUploading ISO to BIG-IP /shared/images ...")
     print(f"Source: {iso_local_path}")
@@ -846,6 +967,7 @@ def exec_upload_iso_standby(
                 "command": " ".join(command),
                 "returncode": completed.returncode,
                 "elapsed_seconds": round(elapsed, 3),
+                "reused_ssh_controlmaster": bool(ssh_control_path),
             },
         )
 
@@ -914,6 +1036,7 @@ def exec_upload_iso_standby(
                 "remote_size": remote_size,
                 "sha256": local_sha256,
                 "elapsed_seconds": round(elapsed, 3),
+                "reused_ssh_controlmaster": bool(ssh_control_path),
             },
         )
     except Exception as exc:
@@ -931,10 +1054,20 @@ def exec_upload_files_standby(
     host: str,
     scp_user: str,
     iso_local_paths: List[str],
+    *,
+    allow_standalone: bool = False,
+    ssh_control_path: Optional[str] = None,
 ) -> List[CheckResult]:
     """Upload multiple ISO files sequentially, verifying each upload."""
     return [
-        exec_upload_iso_standby(client, host=host, scp_user=scp_user, iso_local_path=path)
+        exec_upload_iso_standby(
+            client,
+            host=host,
+            scp_user=scp_user,
+            iso_local_path=path,
+            allow_standalone=allow_standalone,
+            ssh_control_path=ssh_control_path,
+        )
         for path in iso_local_paths
     ]
 
@@ -948,6 +1081,7 @@ def exec_install_standby(
     create_volume: Optional[bool] = None,
     ssh_user: Optional[str] = None,
     ssh_control_path: Optional[str] = None,
+    allow_standalone: bool = False,
 ) -> CheckResult:
     """Submit image installation to the target standby volume.
 
@@ -960,13 +1094,20 @@ def exec_install_standby(
     result_name = "Install image to standby volume (no reboot)"
 
     role = (get_failover_role(client) or "").lower()
-    if role != "standby":
+    if not _execution_role_allowed(role, allow_standalone):
         return CheckResult(
             id=result_id,
             category="Execution",
             name=result_name,
             status="FAIL",
-            details={"error": "Refusing install because device is not STANDBY.", "role": role},
+            details={
+                "error": (
+                    "Refusing install because the device is neither HA "
+                    "STANDBY nor a topology-verified standalone device."
+                ),
+                "role": role,
+                "allow_standalone": allow_standalone,
+            },
         )
 
     expected_version = _extract_version_from_image_name(image_iso_name)
@@ -1032,20 +1173,19 @@ def exec_install_standby(
     print(tmsh_command)
     print("Install progress will be monitored in the next step.")
 
+    submission_method = "rest-single-attempt"
+    ambiguous_rest_error = ""
+
     try:
-        response = _run_bash_with_retry(
-            client,
+        # Do not use _run_bash_with_retry here. Installation is
+        # non-idempotent and must never be blindly resubmitted after a
+        # timeout with an unknown server-side outcome.
+        response = client.run_bash_once(
             tmsh_command,
             timeout=INSTALL_SUBMIT_TIMEOUT_SECONDS,
-            max_retries=INSTALL_SUBMIT_MAX_RETRIES,
-            retry_delay=INSTALL_SUBMIT_RETRY_DELAY_SECONDS,
-            ssh_host=client.host if ssh_user else None,
-            ssh_user=ssh_user,
-            ssh_control_path=ssh_control_path,
         )
-        output = _remote_command_output(response)
-
-        if _is_fatal_tmsh_output(output):
+    except Exception as exc:
+        if not _is_ambiguous_submission_error(exc):
             return CheckResult(
                 id=result_id,
                 category="Execution",
@@ -1058,36 +1198,152 @@ def exec_install_standby(
                     "image_path": image_path,
                     "chosen_volume": target_volume,
                     "tmsh": tmsh_command,
-                    "error": "BIG-IP rejected the install command.",
-                    "command_result": output,
-                    "ssh_fallback_attempted": bool(ssh_user),
-                    "ssh_fallback_reused_existing_connection": bool(
-                        ssh_control_path
-                    ),
+                    "error": str(exc),
+                    "submission_method": submission_method,
+                    "automatic_resubmission": False,
                 },
             )
 
-        return CheckResult(
-            id=result_id,
-            category="Execution",
-            name=result_name,
-            status="PASS",
-            details={
-                "role": role,
-                "image": image_iso_name,
-                "install_type": install_type,
-                "image_path": image_path,
-                "chosen_volume": target_volume,
-                "tmsh": tmsh_command,
-                "note": "Install command submitted. Completion is verified by volume readiness polling.",
-                "command_result": output,
-                "ssh_fallback_attempted": bool(ssh_user),
-                "ssh_fallback_reused_existing_connection": bool(
-                    ssh_control_path
-                ),
-            },
+        ambiguous_rest_error = f"{type(exc).__name__}: {exc}"
+        print(
+            "\n[i] Install submission returned an ambiguous REST error. "
+            "Checking target-volume state before any fallback submission."
         )
-    except Exception as exc:
+
+        observed_state = VolumeState(
+            found=False,
+            volume=target_volume,
+            source="not_checked",
+        )
+        state_source = observed_state.source
+
+        # Allow BIG-IP time to publish the newly created or transitioning
+        # volume. An immediate single check can race the install worker and
+        # incorrectly conclude that the command never started.
+        for verify_attempt in range(1, INSTALL_STATE_VERIFY_ATTEMPTS + 1):
+            observed_state = _get_volume_state(client, target_volume)
+            state_source = observed_state.source
+            if _volume_indicates_install_started(
+                existing,
+                observed_state,
+                expected_version,
+            ):
+                break
+
+            if ssh_user:
+                try:
+                    observed_state = _get_volume_state_via_ssh(
+                        client.host,
+                        ssh_user,
+                        ssh_control_path,
+                        target_volume,
+                    )
+                    state_source = "ssh_tmsh_status"
+                except Exception as state_exc:
+                    state_source = (
+                        "state verification failed: "
+                        f"{type(state_exc).__name__}: {state_exc}"
+                    )
+
+                if _volume_indicates_install_started(
+                    existing,
+                    observed_state,
+                    expected_version,
+                ):
+                    break
+
+            if verify_attempt < INSTALL_STATE_VERIFY_ATTEMPTS:
+                time.sleep(INSTALL_STATE_VERIFY_DELAY_SECONDS)
+
+        if _volume_indicates_install_started(
+            existing,
+            observed_state,
+            expected_version,
+        ):
+            return CheckResult(
+                id=result_id,
+                category="Execution",
+                name=result_name,
+                status="PASS",
+                details={
+                    "role": role,
+                    "image": image_iso_name,
+                    "install_type": install_type,
+                    "image_path": image_path,
+                    "chosen_volume": target_volume,
+                    "tmsh": tmsh_command,
+                    "note": (
+                        "REST response was ambiguous, but target-volume "
+                        "state confirmed that installation started. The "
+                        "command was not resubmitted."
+                    ),
+                    "ambiguous_rest_error": ambiguous_rest_error,
+                    "verified_volume_state": observed_state.__dict__,
+                    "state_verification_source": state_source,
+                    "automatic_resubmission": False,
+                },
+            )
+
+        if not ssh_user:
+            return CheckResult(
+                id=result_id,
+                category="Execution",
+                name=result_name,
+                status="FAIL",
+                details={
+                    "role": role,
+                    "image": image_iso_name,
+                    "install_type": install_type,
+                    "image_path": image_path,
+                    "chosen_volume": target_volume,
+                    "tmsh": tmsh_command,
+                    "error": (
+                        "Install outcome is unknown after an ambiguous REST "
+                        "error. No SSH connection was available, so the "
+                        "command was not resubmitted. Verify the target "
+                        "volume manually before retrying."
+                    ),
+                    "ambiguous_rest_error": ambiguous_rest_error,
+                    "verified_volume_state": observed_state.__dict__,
+                    "state_verification_source": state_source,
+                    "automatic_resubmission": False,
+                },
+            )
+
+        try:
+            # State verification found no evidence that REST started the
+            # installation. Submit exactly once over the existing SSH path.
+            response = _run_bash_via_ssh(
+                client.host,
+                ssh_user,
+                tmsh_command,
+                timeout=INSTALL_SUBMIT_TIMEOUT_SECONDS,
+                control_path=ssh_control_path,
+            )
+            submission_method = "ssh-after-state-verification"
+        except Exception as ssh_exc:
+            return CheckResult(
+                id=result_id,
+                category="Execution",
+                name=result_name,
+                status="FAIL",
+                details={
+                    "role": role,
+                    "image": image_iso_name,
+                    "install_type": install_type,
+                    "image_path": image_path,
+                    "chosen_volume": target_volume,
+                    "tmsh": tmsh_command,
+                    "error": f"Verified SSH submission failed: {ssh_exc}",
+                    "ambiguous_rest_error": ambiguous_rest_error,
+                    "verified_volume_state": observed_state.__dict__,
+                    "state_verification_source": state_source,
+                    "automatic_resubmission": False,
+                },
+            )
+
+    output = _remote_command_output(response)
+    if _is_fatal_tmsh_output(output):
         return CheckResult(
             id=result_id,
             category="Execution",
@@ -1100,13 +1356,39 @@ def exec_install_standby(
                 "image_path": image_path,
                 "chosen_volume": target_volume,
                 "tmsh": tmsh_command,
-                "error": str(exc),
-                "ssh_fallback_attempted": bool(ssh_user),
-                "ssh_fallback_reused_existing_connection": bool(
-                    ssh_control_path
-                ),
+                "error": "BIG-IP rejected the install command.",
+                "command_result": output,
+                "submission_method": submission_method,
+                "ambiguous_rest_error": ambiguous_rest_error,
+                "automatic_resubmission": False,
             },
         )
+
+    return CheckResult(
+        id=result_id,
+        category="Execution",
+        name=result_name,
+        status="PASS",
+        details={
+            "role": role,
+            "image": image_iso_name,
+            "install_type": install_type,
+            "image_path": image_path,
+            "chosen_volume": target_volume,
+            "tmsh": tmsh_command,
+            "note": (
+                "Install command submitted once. Completion is verified "
+                "by volume readiness polling."
+            ),
+            "command_result": output,
+            "submission_method": submission_method,
+            "ambiguous_rest_error": ambiguous_rest_error,
+            "automatic_resubmission": False,
+            "ssh_fallback_reused_existing_connection": bool(
+                ssh_control_path
+            ),
+        },
+    )
 
 
 def exec_volume_ready(
@@ -1203,23 +1485,37 @@ def _is_expected_reboot_disconnect(error: Exception) -> bool:
     return any(marker in text for marker in ("remotedisconnected", "remote end closed connection", "connection aborted", "connection reset", "badstatusline"))
 
 
-def exec_reboot_to_volume_standby(client: BigIPClient, volume: str) -> CheckResult:
+def exec_reboot_to_volume_standby(
+    client: BigIPClient,
+    volume: str,
+    *,
+    allow_standalone: bool = False,
+) -> CheckResult:
     """Reboot the standby BIG-IP into the target volume."""
     result_id = "EXEC-REBOOT-TO-VOL-001"
     result_name = "Reboot to target volume (standby only)"
 
     role = (get_failover_role(client) or "").lower()
-    if role != "standby":
+    if not _execution_role_allowed(role, allow_standalone):
         return CheckResult(
             id=result_id,
             category="Execution",
             name=result_name,
             status="FAIL",
-            details={"error": "Refusing reboot because device is not STANDBY.", "role": role, "volume": volume},
+            details={
+                "error": (
+                    "Refusing reboot because the device is neither HA "
+                    "STANDBY nor a topology-verified standalone device."
+                ),
+                "role": role,
+                "volume": volume,
+                "allow_standalone": allow_standalone,
+            },
         )
 
     tmsh_command = f"tmsh reboot volume {volume}"
-    print(f"\nRebooting STANDBY device into target volume {volume}.")
+    mode = _execution_mode(role, allow_standalone)
+    print(f"\nRebooting {mode.upper()} device into target volume {volume}.")
     print(tmsh_command)
 
     try:
@@ -1254,8 +1550,9 @@ def exec_wait_postboot(
     expect_version_contains: str,
     timeout_sec: int = 900,
     interval_sec: int = 15,
+    allow_standalone: bool = False,
 ) -> CheckResult:
-    """Wait until the device is reachable after reboot, is running the expected version, and is back in STANDBY."""
+    """Validate version and the expected HA-standby or standalone role."""
     result_id = "VAL-POSTBOOT-001"
     result_name = "Post-boot validation"
     deadline = time.time() + timeout_sec
@@ -1276,15 +1573,27 @@ def exec_wait_postboot(
 
             if expect_version_contains and expect_version_contains not in version_text:
                 last_error = "Version does not match expectation yet."
-            elif (role or "").lower() != "standby":
-                last_error = f"Device is not STANDBY yet. Current role: {role}"
+            elif not _execution_role_allowed(role or "", allow_standalone):
+                expected_role = "ACTIVE (standalone)" if allow_standalone else "STANDBY"
+                last_error = (
+                    f"Device is not in the expected {expected_role} role yet. "
+                    f"Current role: {role}"
+                )
             else:
+                mode = _execution_mode(role or "", allow_standalone)
                 return CheckResult(
                     id=result_id,
                     category="Validation",
                     name=result_name,
                     status="PASS",
-                    details={"note": "Device is reachable with the expected version and standby role.", **last_seen},
+                    details={
+                        "note": (
+                            "Device is reachable with the expected version "
+                            f"and valid {mode} role."
+                        ),
+                        "execution_mode": mode,
+                        **last_seen,
+                    },
                 )
         except requests.exceptions.RequestException as exc:
             last_error = str(exc)
