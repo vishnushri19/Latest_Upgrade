@@ -105,6 +105,56 @@ class UpgradeFlow:
                 self._preflight_results = results
                 return list(results)
 
+        # --- Standalone detection: a device with no HA peer(s) in its trust
+        # domain has no "standby" to fail over to. tmsh/REST report such a
+        # device as "active" (there is no other state without a peer), so we
+        # must not apply the HA active/standby lock in that case. If 2+
+        # devices are present, this is a real HA pair/cluster and the strict
+        # active/standby lock below still applies.
+        #
+        # Safety note: client.devices() itself falls back to raw tmsh bash
+        # text (no "items" key) if the REST call fails. We must NOT
+        # misinterpret that fallback as "0 devices" -> "standalone", since
+        # that would incorrectly bypass the active/standby lock on a real HA
+        # pair whose REST endpoint happens to be flaky. Only trust the
+        # device count when the REST payload actually returned "items".
+        is_standalone = False
+        device_count: Optional[int] = None
+        try:
+            payload = self.client.devices()
+            if not isinstance(payload, dict) or "items" not in payload:
+                raise RuntimeError(
+                    "devices() did not return a structured 'items' list "
+                    "(REST endpoint may have fallen back to raw tmsh text); "
+                    "cannot reliably determine device count."
+                )
+            devices = payload.get("items") or []
+            device_count = len(devices)
+            is_standalone = device_count <= 1
+        except Exception as e:
+            # If discovery fails or is unreliable, fail safe: do NOT assume
+            # standalone. The existing active/standby lock still applies
+            # below.
+            results.append(
+                CheckResult(
+                    id="FLOW-STANDALONE-001",
+                    category="Upgrade Flow",
+                    name="Standalone/HA topology detection failed",
+                    status="RISK_ACCEPTED",
+                    details={
+                        "note": "Could not determine trust-domain device count; treating device as HA (active/standby lock still applies).",
+                        "error": str(e),
+                    },
+                )
+            )
+
+        if is_standalone:
+            print(
+                f"\n[i] Device {self.client.host} has no HA peer in its trust domain "
+                f"(device_count={device_count}). Treating as STANDALONE; the "
+                "active/standby lock does not apply."
+            )
+
         target = (self.settings.target_image_contains or "").strip()
 
         # 1) If already on target version, skip EXEC steps (idempotence)
@@ -128,7 +178,10 @@ class UpgradeFlow:
             return list(results)
 
         # 2) If ACTIVE, do not run upgrade steps (but still run prechecks)
-        if role == "active":
+        #    Skip this lock entirely for standalone devices (no HA peer),
+        #    since "active" is the only state such a device can report and
+        #    there is no standby to fail over to.
+        if role == "active" and not is_standalone:
             # Prechecks on active node
             print(f"\n[*] Running prechecks on active node {self.client.host}...")
             precheck_results = run_prechecks(self.client)
@@ -168,9 +221,14 @@ class UpgradeFlow:
             self._preflight_results = results
             return list(results)
 
-        # From here on, we assume role is STANDBY (or unknown but not 'active')
+        # From here on, either role is STANDBY (or unknown but not 'active'),
+        # or the device is a standalone unit where the active/standby lock
+        # does not apply.
         print(f"\n" + "=" * 75)
-        print(f"🟢 Target device {self.client.host} is STANDBY. Proceeding with upgrade execution...")
+        if is_standalone:
+            print(f"🟢 Target device {self.client.host} is STANDALONE (no HA peer). Proceeding with upgrade execution...")
+        else:
+            print(f"🟢 Target device {self.client.host} is STANDBY. Proceeding with upgrade execution...")
         print("=" * 75)
 
         # --- Prechecks (always run before upgrade) ---
