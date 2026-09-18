@@ -104,12 +104,18 @@ make install
 - export LICENSE_DATE_TIMEOUT_SECONDS="60"   # per-command REST timeout for LIC-001 date checks (default 60)
 - export LICENSE_DATE_MAX_RETRIES="2"         # REST retry attempts before falling back to SSH (default 2)
 - export LICENSE_DATE_RETRY_DELAY_SECONDS="15"  # delay between LIC-001 REST retries (default 15)
+- export IMAGE_CHECK_TIMEOUT_SECONDS="60"     # per-command timeout for /shared/images checks (default 60)
+- export IMAGE_CHECK_MAX_RETRIES="3"          # REST retry attempts before falling back to SSH (default 3)
+- export IMAGE_CHECK_RETRY_DELAY_SECONDS="10" # delay between image-check retries (default 10)
 - # LIC-001 automatically falls back to a direct SSH command (using SCP_USER)
 - # if the REST util/bash endpoint keeps timing out, which has been observed
 - # right after heavy UCS/QKView/ASMQKView backup operations. This fallback
 - # reuses the same authenticated SSH connection opened for the backup stage
 - # (run_upgrade_node.py keeps it open until Stage 2 finishes), so it does
 - # NOT prompt for a second password mid-flow.
+- # The /shared/images image-presence check uses the same retry and SSH
+- # fallback path, so transient REST/icrd failures do not make a present ISO
+- # appear missing.
 
 ### Single password prompt for the entire run
 When SCP_USER matches BIGIP_USER (the default), the shared SSH connection used
@@ -186,4 +192,3 @@ Senior F5 engineers managing production environments
 Organizations planning major BIG-IP version upgrades
 
 It is not intended as a beginner tutorial or quick-start upgrade guide.
-

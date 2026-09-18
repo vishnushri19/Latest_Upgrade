@@ -330,7 +330,12 @@ class UpgradeFlow:
         ]
         required_images_present = bool(expected_names)
         for image_name in expected_names:
-            image = check_image_present(self.client, image_name)
+            image = check_image_present(
+                self.client,
+                image_name,
+                ssh_user=self.settings.scp_user,
+                ssh_control_path=self.ssh_control_path,
+            )
             required_images_present = required_images_present and image.found
         if not expected_names:
             required_images_present = True
@@ -394,11 +399,20 @@ class UpgradeFlow:
             expected_names = [expected_names[-1]]
         img = check_image_present(
             self.client,
-            expected_names[0] if expected_names else self.settings.target_image_contains,
+            expected_names[0]
+            if expected_names
+            else self.settings.target_image_contains,
+            ssh_user=self.settings.scp_user,
+            ssh_control_path=self.ssh_control_path,
         )
         if combined_ehf:
             base_name = os.path.basename(self.settings.base_iso_local_path)
-            base_img = check_image_present(self.client, base_name)
+            base_img = check_image_present(
+                self.client,
+                base_name,
+                ssh_user=self.settings.scp_user,
+                ssh_control_path=self.ssh_control_path,
+            )
             results.append(
                 CheckResult(
                     id="EXEC-BASE-IMG-001",

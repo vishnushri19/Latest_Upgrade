@@ -190,8 +190,30 @@ def _sha256_file(path: str) -> str:
     return digest.hexdigest()
 
 
-def check_image_present(client: BigIPClient, image_name_contains: str) -> ImagePresenceResult:
-    """Verify that the ISO physically exists under /shared/images."""
+IMAGE_CHECK_TIMEOUT_SECONDS = int(
+    os.environ.get("IMAGE_CHECK_TIMEOUT_SECONDS", "60")
+)
+IMAGE_CHECK_MAX_RETRIES = int(
+    os.environ.get("IMAGE_CHECK_MAX_RETRIES", "3")
+)
+IMAGE_CHECK_RETRY_DELAY_SECONDS = int(
+    os.environ.get("IMAGE_CHECK_RETRY_DELAY_SECONDS", "10")
+)
+
+
+def check_image_present(
+    client: BigIPClient,
+    image_name_contains: str,
+    *,
+    ssh_user: Optional[str] = None,
+    ssh_control_path: Optional[str] = None,
+) -> ImagePresenceResult:
+    """Verify that the ISO exists under /shared/images.
+
+    The filesystem check retries transient REST failures and then uses the
+    existing SSH ControlMaster when REST remains unavailable. This prevents a
+    temporary icrd outage from reporting a present image as missing.
+    """
     needle = (image_name_contains or "").strip().lower()
     available_images = []
     rest_error = ""
@@ -209,7 +231,16 @@ def check_image_present(client: BigIPClient, image_name_contains: str) -> ImageP
         rest_error = f"{type(exc).__name__}: {exc}"
 
     try:
-        response = client.run_bash("ls -1 /shared/images/ 2>/dev/null | head -n 500", timeout=60)
+        response = _run_bash_with_retry(
+            client,
+            "ls -1 /shared/images/ 2>/dev/null | head -n 500",
+            timeout=IMAGE_CHECK_TIMEOUT_SECONDS,
+            max_retries=IMAGE_CHECK_MAX_RETRIES,
+            retry_delay=IMAGE_CHECK_RETRY_DELAY_SECONDS,
+            ssh_host=client.host if ssh_user else None,
+            ssh_user=ssh_user,
+            ssh_control_path=ssh_control_path,
+        )
         output = _remote_command_output(response)
         filesystem_images = [
             line.strip()
@@ -225,6 +256,10 @@ def check_image_present(client: BigIPClient, image_name_contains: str) -> ImageP
                 "method": "filesystem",
                 "available_images": available_images,
                 "rest_error": rest_error,
+                "ssh_fallback_attempted": bool(ssh_user),
+                "ssh_fallback_reused_existing_connection": bool(
+                    ssh_control_path
+                ),
                 "error": f"Could not inspect /shared/images: {type(exc).__name__}: {exc}",
             },
         )
@@ -339,6 +374,15 @@ def _run_bash_with_retry(
             requests.exceptions.ConnectionError,
             requests.exceptions.Timeout,
         ) as exc:
+            last_exc = exc
+            if attempt < max_retries:
+                time.sleep(retry_delay)
+                continue
+        except requests.exceptions.HTTPError as exc:
+            response = getattr(exc, "response", None)
+            status_code = getattr(response, "status_code", None)
+            if status_code not in (502, 503, 504):
+                raise
             last_exc = exc
             if attempt < max_retries:
                 time.sleep(retry_delay)
