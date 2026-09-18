@@ -468,6 +468,7 @@ class UpgradeFlow:
         if not img.found or not self._confirm_install(
             img.matched_name or "",
             self.settings.target_volume,
+            allow_standalone=self._is_standalone,
         ):
             results.append(
                 CheckResult(
@@ -549,7 +550,12 @@ class UpgradeFlow:
         return results
 
     @staticmethod
-    def _confirm_install(image_name: str, target_volume: str) -> bool:
+    def _confirm_install(
+        image_name: str,
+        target_volume: str,
+        *,
+        allow_standalone: bool = False,
+    ) -> bool:
         """Require an explicit operator confirmation before installation."""
         print(
             f"\nImage already exists in /shared/images/: {image_name}\n"
@@ -563,8 +569,10 @@ class UpgradeFlow:
             return False
 
         try:
+            reboot_mode = "standalone" if allow_standalone else "standby"
             answer = input(
-                "Continue with image installation and standby reboot? (y/N): "
+                "Continue with image installation and "
+                f"{reboot_mode} reboot? (y/N): "
             ).strip().lower()
         except (EOFError, KeyboardInterrupt):
             return False

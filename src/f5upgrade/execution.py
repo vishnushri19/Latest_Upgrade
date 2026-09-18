@@ -499,6 +499,9 @@ def check_license_dates(
     ssh_host = client.host if ssh_user else None
     stage = "version_date lookup"
 
+    print("\n[LIC-001] Validating ISO license-check date...")
+    print(f"Image: {image_name}")
+
     try:
         version_response = _run_bash_with_retry(
             client,
@@ -556,11 +559,19 @@ def check_license_dates(
             raise ValueError("BIG-IP service-check date was not found.")
 
         reactivation_required = service_date < iso_date
+        status = "FAIL" if reactivation_required else "PASS"
+        print(f"ISO license-check date: {iso_date}")
+        print(f"Device service-check date: {service_date}")
+        print(
+            "License reactivation required: "
+            f"{'Yes' if reactivation_required else 'No'}"
+        )
+        print(f"[LIC-001] {status}")
         return CheckResult(
             id=result_id,
             category="License and Platform Readiness",
             name=result_name,
-            status="FAIL" if reactivation_required else "PASS",
+            status=status,
             details={
                 "image": image_name,
                 "iso_license_check_date": iso_date,
@@ -574,6 +585,7 @@ def check_license_dates(
             },
         )
     except Exception as exc:
+        print(f"[LIC-001] FAIL during {stage}: {type(exc).__name__}: {exc}")
         return CheckResult(
             id=result_id,
             category="License and Platform Readiness",

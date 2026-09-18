@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import io
 import sys
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -17,6 +19,7 @@ if str(SRC_ROOT) not in sys.path:
 from f5upgrade.execution import (  # noqa: E402
     VolumeState,
     _execution_role_allowed,
+    check_license_dates,
     exec_install_standby,
     exec_upload_iso_standby,
 )
@@ -150,6 +153,94 @@ class ScpControlMasterTests(unittest.TestCase):
             command,
         )
         self.assertFalse(result.details["reused_ssh_controlmaster"])
+
+
+class LicenseValidationOutputTests(unittest.TestCase):
+    def test_license_pass_prints_dates_and_result(self):
+        client = SimpleNamespace(host="192.0.2.10")
+        responses = [
+            {"commandResult": "/version_date"},
+            {"commandResult": "20250115"},
+            {"commandResult": "Service check date : 20260801"},
+        ]
+        output = io.StringIO()
+
+        with (
+            patch(
+                "f5upgrade.execution._run_bash_with_retry",
+                side_effect=responses,
+            ),
+            redirect_stdout(output),
+        ):
+            result = check_license_dates(
+                client,
+                "BIGIP-17.5.1.9-0.0.12.iso",
+                ssh_user="admin",
+            )
+
+        text = output.getvalue()
+        self.assertEqual("PASS", result.status)
+        self.assertIn("[LIC-001] Validating ISO license-check date", text)
+        self.assertIn("ISO license-check date: 20250115", text)
+        self.assertIn("Device service-check date: 20260801", text)
+        self.assertIn("License reactivation required: No", text)
+        self.assertIn("[LIC-001] PASS", text)
+
+    def test_license_failure_prints_reactivation_required(self):
+        client = SimpleNamespace(host="192.0.2.10")
+        responses = [
+            {"commandResult": "/version_date"},
+            {"commandResult": "20270115"},
+            {"commandResult": "Service check date : 20260801"},
+        ]
+        output = io.StringIO()
+
+        with (
+            patch(
+                "f5upgrade.execution._run_bash_with_retry",
+                side_effect=responses,
+            ),
+            redirect_stdout(output),
+        ):
+            result = check_license_dates(
+                client,
+                "BIGIP-21.0.0-0.0.1.iso",
+                ssh_user="admin",
+            )
+
+        text = output.getvalue()
+        self.assertEqual("FAIL", result.status)
+        self.assertIn("License reactivation required: Yes", text)
+        self.assertIn("[LIC-001] FAIL", text)
+
+
+class ConfirmationPromptTests(unittest.TestCase):
+    def test_standalone_prompt_uses_standalone_wording(self):
+        with (
+            patch("f5upgrade.flow.sys.stdin.isatty", return_value=True),
+            patch("builtins.input", return_value="y") as input_mock,
+        ):
+            confirmed = UpgradeFlow._confirm_install(
+                "BIGIP-17.5.1.9-0.0.12.iso",
+                "HD1.2",
+                allow_standalone=True,
+            )
+
+        self.assertTrue(confirmed)
+        self.assertIn("standalone reboot", input_mock.call_args.args[0])
+
+    def test_ha_prompt_retains_standby_wording(self):
+        with (
+            patch("f5upgrade.flow.sys.stdin.isatty", return_value=True),
+            patch("builtins.input", return_value="y") as input_mock,
+        ):
+            confirmed = UpgradeFlow._confirm_install(
+                "BIGIP-17.5.1.9-0.0.12.iso",
+                "HD1.2",
+            )
+
+        self.assertTrue(confirmed)
+        self.assertIn("standby reboot", input_mock.call_args.args[0])
 
 
 class InstallSubmissionTests(unittest.TestCase):
