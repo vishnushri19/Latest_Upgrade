@@ -19,6 +19,7 @@ if str(SRC_ROOT) not in sys.path:
 from f5upgrade.execution import (  # noqa: E402
     VolumeState,
     _execution_role_allowed,
+    check_image_present,
     check_license_dates,
     exec_install_standby,
     exec_upload_iso_standby,
@@ -156,6 +157,38 @@ class ScpControlMasterTests(unittest.TestCase):
 
 
 class LicenseValidationOutputTests(unittest.TestCase):
+    def test_license_validation_prefers_existing_ssh_controlmaster(self):
+        client = SimpleNamespace(host="192.0.2.10")
+        responses = [
+            {"commandResult": "/version_date"},
+            {"commandResult": "20250115"},
+            {"commandResult": "Service check date : 20260801"},
+        ]
+        output = io.StringIO()
+
+        with (
+            patch(
+                "f5upgrade.execution._run_bash_via_ssh",
+                side_effect=responses,
+            ) as ssh_mock,
+            patch("f5upgrade.execution._run_bash_with_retry") as rest_mock,
+            redirect_stdout(output),
+        ):
+            result = check_license_dates(
+                client,
+                "BIGIP-17.5.1.9-0.0.12.iso",
+                ssh_user="admin",
+                ssh_control_path="control.sock",
+            )
+
+        self.assertEqual("PASS", result.status)
+        self.assertEqual(3, ssh_mock.call_count)
+        rest_mock.assert_not_called()
+        self.assertIn(
+            "Validation transport: authenticated SSH ControlMaster",
+            output.getvalue(),
+        )
+
     def test_license_pass_prints_dates_and_result(self):
         client = SimpleNamespace(host="192.0.2.10")
         responses = [
@@ -212,6 +245,61 @@ class LicenseValidationOutputTests(unittest.TestCase):
         self.assertEqual("FAIL", result.status)
         self.assertIn("License reactivation required: Yes", text)
         self.assertIn("[LIC-001] FAIL", text)
+
+
+class ImageValidationTransportTests(unittest.TestCase):
+    def test_image_check_prefers_existing_ssh_controlmaster(self):
+        client = Mock()
+        client.host = "192.0.2.10"
+
+        with (
+            patch(
+                "f5upgrade.execution._run_bash_via_ssh",
+                return_value={
+                    "commandResult": "BIGIP-17.5.1.9-0.0.12.iso\n"
+                },
+            ) as ssh_mock,
+            patch("f5upgrade.execution._run_bash_with_retry") as rest_mock,
+        ):
+            result = check_image_present(
+                client,
+                "17.5.1.9",
+                ssh_user="admin",
+                ssh_control_path="control.sock",
+            )
+
+        self.assertTrue(result.found)
+        client.software_images.assert_not_called()
+        ssh_mock.assert_called_once()
+        rest_mock.assert_not_called()
+
+    def test_image_check_falls_back_when_controlmaster_fails(self):
+        client = Mock()
+        client.host = "192.0.2.10"
+
+        with (
+            patch(
+                "f5upgrade.execution._run_bash_via_ssh",
+                side_effect=RuntimeError("control socket unavailable"),
+            ) as ssh_mock,
+            patch(
+                "f5upgrade.execution._run_bash_with_retry",
+                return_value={
+                    "commandResult": "BIGIP-17.5.1.9-0.0.12.iso\n"
+                },
+            ) as rest_mock,
+        ):
+            result = check_image_present(
+                client,
+                "17.5.1.9",
+                ssh_user="admin",
+                ssh_control_path="control.sock",
+            )
+
+        self.assertTrue(result.found)
+        client.software_images.assert_not_called()
+        ssh_mock.assert_called_once()
+        rest_mock.assert_called_once()
 
 
 class ConfirmationPromptTests(unittest.TestCase):
