@@ -196,12 +196,12 @@ IMAGE_CHECK_TIMEOUT_SECONDS = 60
 IMAGE_CHECK_MAX_RETRIES = 3
 IMAGE_CHECK_RETRY_DELAY_SECONDS = 10
 
-# Install-submission uses the same fixed internal retry settings as the
-# image check, so a transient icrd/REST outage does not fail the install
-# step outright when SSH fallback can complete it instead.
+# Install submission is intentionally single-attempt. A timeout can occur
+# after BIG-IP accepted the command, so blind retries could submit the same
+# non-idempotent install multiple times.
 INSTALL_SUBMIT_TIMEOUT_SECONDS = 120
-INSTALL_SUBMIT_MAX_RETRIES = 3
-INSTALL_SUBMIT_RETRY_DELAY_SECONDS = 10
+INSTALL_STATE_VERIFY_ATTEMPTS = 3
+INSTALL_STATE_VERIFY_DELAY_SECONDS = 10
 
 
 def check_image_present(
@@ -408,6 +408,79 @@ def _run_bash_with_retry(
     if last_exc:
         raise last_exc
     raise RuntimeError("Unreachable: run_bash retry loop exited without a result.")
+
+
+def _is_ambiguous_submission_error(error: Exception) -> bool:
+    """Return True when BIG-IP may have accepted a timed-out REST request."""
+    if isinstance(
+        error,
+        (
+            requests.exceptions.Timeout,
+            requests.exceptions.ConnectionError,
+        ),
+    ):
+        return True
+    if isinstance(error, requests.exceptions.HTTPError):
+        response = getattr(error, "response", None)
+        return getattr(response, "status_code", None) in (502, 503, 504)
+    return False
+
+
+def _get_volume_state_via_ssh(
+    host: str,
+    user: str,
+    control_path: Optional[str],
+    volume: str,
+) -> VolumeState:
+    """Read target-volume state through the authenticated SSH connection."""
+    response = _run_bash_via_ssh(
+        host,
+        user,
+        "tmsh show sys software status",
+        timeout=30,
+        control_path=control_path,
+    )
+    return _parse_volume_from_tmsh_status(
+        _remote_command_output(response),
+        volume,
+    )
+
+
+def _volume_indicates_install_started(
+    before: VolumeState,
+    after: VolumeState,
+    expected_version: str,
+) -> bool:
+    """Determine whether state changed enough to prove submission started."""
+    if not after.found:
+        return False
+
+    status = after.status.lower()
+    in_progress = any(
+        marker in status
+        for marker in (
+            "installing",
+            "testing",
+            "copying",
+            "pending",
+            "waiting",
+            "validating",
+        )
+    )
+    version_matches = bool(
+        expected_version and expected_version in after.version
+    )
+
+    if not before.found:
+        return in_progress or version_matches
+
+    state_changed = (
+        before.version != after.version
+        or before.status != after.status
+        or before.build != after.build
+        or before.raw != after.raw
+    )
+    return state_changed and (in_progress or version_matches)
 
 
 def check_license_dates(
@@ -1083,20 +1156,19 @@ def exec_install_standby(
     print(tmsh_command)
     print("Install progress will be monitored in the next step.")
 
+    submission_method = "rest-single-attempt"
+    ambiguous_rest_error = ""
+
     try:
-        response = _run_bash_with_retry(
-            client,
+        # Do not use _run_bash_with_retry here. Installation is
+        # non-idempotent and must never be blindly resubmitted after a
+        # timeout with an unknown server-side outcome.
+        response = client.run_bash_once(
             tmsh_command,
             timeout=INSTALL_SUBMIT_TIMEOUT_SECONDS,
-            max_retries=INSTALL_SUBMIT_MAX_RETRIES,
-            retry_delay=INSTALL_SUBMIT_RETRY_DELAY_SECONDS,
-            ssh_host=client.host if ssh_user else None,
-            ssh_user=ssh_user,
-            ssh_control_path=ssh_control_path,
         )
-        output = _remote_command_output(response)
-
-        if _is_fatal_tmsh_output(output):
+    except Exception as exc:
+        if not _is_ambiguous_submission_error(exc):
             return CheckResult(
                 id=result_id,
                 category="Execution",
@@ -1109,36 +1181,152 @@ def exec_install_standby(
                     "image_path": image_path,
                     "chosen_volume": target_volume,
                     "tmsh": tmsh_command,
-                    "error": "BIG-IP rejected the install command.",
-                    "command_result": output,
-                    "ssh_fallback_attempted": bool(ssh_user),
-                    "ssh_fallback_reused_existing_connection": bool(
-                        ssh_control_path
-                    ),
+                    "error": str(exc),
+                    "submission_method": submission_method,
+                    "automatic_resubmission": False,
                 },
             )
 
-        return CheckResult(
-            id=result_id,
-            category="Execution",
-            name=result_name,
-            status="PASS",
-            details={
-                "role": role,
-                "image": image_iso_name,
-                "install_type": install_type,
-                "image_path": image_path,
-                "chosen_volume": target_volume,
-                "tmsh": tmsh_command,
-                "note": "Install command submitted. Completion is verified by volume readiness polling.",
-                "command_result": output,
-                "ssh_fallback_attempted": bool(ssh_user),
-                "ssh_fallback_reused_existing_connection": bool(
-                    ssh_control_path
-                ),
-            },
+        ambiguous_rest_error = f"{type(exc).__name__}: {exc}"
+        print(
+            "\n[i] Install submission returned an ambiguous REST error. "
+            "Checking target-volume state before any fallback submission."
         )
-    except Exception as exc:
+
+        observed_state = VolumeState(
+            found=False,
+            volume=target_volume,
+            source="not_checked",
+        )
+        state_source = observed_state.source
+
+        # Allow BIG-IP time to publish the newly created or transitioning
+        # volume. An immediate single check can race the install worker and
+        # incorrectly conclude that the command never started.
+        for verify_attempt in range(1, INSTALL_STATE_VERIFY_ATTEMPTS + 1):
+            observed_state = _get_volume_state(client, target_volume)
+            state_source = observed_state.source
+            if _volume_indicates_install_started(
+                existing,
+                observed_state,
+                expected_version,
+            ):
+                break
+
+            if ssh_user:
+                try:
+                    observed_state = _get_volume_state_via_ssh(
+                        client.host,
+                        ssh_user,
+                        ssh_control_path,
+                        target_volume,
+                    )
+                    state_source = "ssh_tmsh_status"
+                except Exception as state_exc:
+                    state_source = (
+                        "state verification failed: "
+                        f"{type(state_exc).__name__}: {state_exc}"
+                    )
+
+                if _volume_indicates_install_started(
+                    existing,
+                    observed_state,
+                    expected_version,
+                ):
+                    break
+
+            if verify_attempt < INSTALL_STATE_VERIFY_ATTEMPTS:
+                time.sleep(INSTALL_STATE_VERIFY_DELAY_SECONDS)
+
+        if _volume_indicates_install_started(
+            existing,
+            observed_state,
+            expected_version,
+        ):
+            return CheckResult(
+                id=result_id,
+                category="Execution",
+                name=result_name,
+                status="PASS",
+                details={
+                    "role": role,
+                    "image": image_iso_name,
+                    "install_type": install_type,
+                    "image_path": image_path,
+                    "chosen_volume": target_volume,
+                    "tmsh": tmsh_command,
+                    "note": (
+                        "REST response was ambiguous, but target-volume "
+                        "state confirmed that installation started. The "
+                        "command was not resubmitted."
+                    ),
+                    "ambiguous_rest_error": ambiguous_rest_error,
+                    "verified_volume_state": observed_state.__dict__,
+                    "state_verification_source": state_source,
+                    "automatic_resubmission": False,
+                },
+            )
+
+        if not ssh_user:
+            return CheckResult(
+                id=result_id,
+                category="Execution",
+                name=result_name,
+                status="FAIL",
+                details={
+                    "role": role,
+                    "image": image_iso_name,
+                    "install_type": install_type,
+                    "image_path": image_path,
+                    "chosen_volume": target_volume,
+                    "tmsh": tmsh_command,
+                    "error": (
+                        "Install outcome is unknown after an ambiguous REST "
+                        "error. No SSH connection was available, so the "
+                        "command was not resubmitted. Verify the target "
+                        "volume manually before retrying."
+                    ),
+                    "ambiguous_rest_error": ambiguous_rest_error,
+                    "verified_volume_state": observed_state.__dict__,
+                    "state_verification_source": state_source,
+                    "automatic_resubmission": False,
+                },
+            )
+
+        try:
+            # State verification found no evidence that REST started the
+            # installation. Submit exactly once over the existing SSH path.
+            response = _run_bash_via_ssh(
+                client.host,
+                ssh_user,
+                tmsh_command,
+                timeout=INSTALL_SUBMIT_TIMEOUT_SECONDS,
+                control_path=ssh_control_path,
+            )
+            submission_method = "ssh-after-state-verification"
+        except Exception as ssh_exc:
+            return CheckResult(
+                id=result_id,
+                category="Execution",
+                name=result_name,
+                status="FAIL",
+                details={
+                    "role": role,
+                    "image": image_iso_name,
+                    "install_type": install_type,
+                    "image_path": image_path,
+                    "chosen_volume": target_volume,
+                    "tmsh": tmsh_command,
+                    "error": f"Verified SSH submission failed: {ssh_exc}",
+                    "ambiguous_rest_error": ambiguous_rest_error,
+                    "verified_volume_state": observed_state.__dict__,
+                    "state_verification_source": state_source,
+                    "automatic_resubmission": False,
+                },
+            )
+
+    output = _remote_command_output(response)
+    if _is_fatal_tmsh_output(output):
         return CheckResult(
             id=result_id,
             category="Execution",
@@ -1151,13 +1339,39 @@ def exec_install_standby(
                 "image_path": image_path,
                 "chosen_volume": target_volume,
                 "tmsh": tmsh_command,
-                "error": str(exc),
-                "ssh_fallback_attempted": bool(ssh_user),
-                "ssh_fallback_reused_existing_connection": bool(
-                    ssh_control_path
-                ),
+                "error": "BIG-IP rejected the install command.",
+                "command_result": output,
+                "submission_method": submission_method,
+                "ambiguous_rest_error": ambiguous_rest_error,
+                "automatic_resubmission": False,
             },
         )
+
+    return CheckResult(
+        id=result_id,
+        category="Execution",
+        name=result_name,
+        status="PASS",
+        details={
+            "role": role,
+            "image": image_iso_name,
+            "install_type": install_type,
+            "image_path": image_path,
+            "chosen_volume": target_volume,
+            "tmsh": tmsh_command,
+            "note": (
+                "Install command submitted once. Completion is verified "
+                "by volume readiness polling."
+            ),
+            "command_result": output,
+            "submission_method": submission_method,
+            "ambiguous_rest_error": ambiguous_rest_error,
+            "automatic_resubmission": False,
+            "ssh_fallback_reused_existing_connection": bool(
+                ssh_control_path
+            ),
+        },
+    )
 
 
 def exec_volume_ready(
