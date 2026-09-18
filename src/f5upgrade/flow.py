@@ -391,6 +391,7 @@ class UpgradeFlow:
                 scp_user=self.settings.scp_user,
                 iso_local_paths=upload_paths,
                 allow_standalone=self._is_standalone,
+                ssh_control_path=self.ssh_control_path,
             )
             results.extend(upload_results)
             if self.should_stop(results):

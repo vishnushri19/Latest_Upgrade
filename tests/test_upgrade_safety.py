@@ -18,6 +18,7 @@ from f5upgrade.execution import (  # noqa: E402
     VolumeState,
     _execution_role_allowed,
     exec_install_standby,
+    exec_upload_iso_standby,
 )
 from f5upgrade.flow import UpgradeFlow  # noqa: E402
 
@@ -96,6 +97,59 @@ class StandaloneTopologyTests(unittest.TestCase):
         result_ids = {result.id for result in results}
         self.assertIn("FLOW-STANDALONE-001", result_ids)
         self.assertIn("FLOW-SKIP-002", result_ids)
+
+
+class ScpControlMasterTests(unittest.TestCase):
+    def run_upload(self, ssh_control_path=None):
+        digest = "a" * 64
+        client = Mock()
+        client.run_bash.return_value = {
+            "commandResult": f"4\n{digest}  /shared/images/test.iso"
+        }
+
+        with (
+            patch("f5upgrade.execution.get_failover_role", return_value="standby"),
+            patch("f5upgrade.execution.os.path.isfile", return_value=True),
+            patch("f5upgrade.execution.os.path.getsize", return_value=4),
+            patch("f5upgrade.execution._sha256_file", return_value=digest),
+            patch(
+                "f5upgrade.execution.subprocess.run",
+                return_value=SimpleNamespace(returncode=0),
+            ) as scp_run,
+        ):
+            result = exec_upload_iso_standby(
+                client,
+                host="192.0.2.10",
+                scp_user="admin",
+                iso_local_path="test.iso",
+                ssh_control_path=ssh_control_path,
+            )
+
+        return result, scp_run.call_args.args[0]
+
+    def test_scp_reuses_controlmaster_without_password_prompt(self):
+        result, command = self.run_upload("control.sock")
+
+        self.assertEqual("PASS", result.status)
+        self.assertIn("ControlPath=control.sock", command)
+        self.assertIn("ControlMaster=auto", command)
+        self.assertIn("BatchMode=yes", command)
+        self.assertTrue(result.details["reused_ssh_controlmaster"])
+
+    def test_scp_without_control_path_preserves_original_command(self):
+        result, command = self.run_upload()
+
+        self.assertEqual("PASS", result.status)
+        self.assertEqual(
+            [
+                "scp",
+                "-O",
+                "test.iso",
+                "admin@192.0.2.10:/shared/images/",
+            ],
+            command,
+        )
+        self.assertFalse(result.details["reused_ssh_controlmaster"])
 
 
 class InstallSubmissionTests(unittest.TestCase):

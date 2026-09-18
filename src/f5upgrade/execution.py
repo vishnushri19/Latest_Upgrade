@@ -868,6 +868,7 @@ def exec_upload_iso_standby(
     iso_local_path: str,
     *,
     allow_standalone: bool = False,
+    ssh_control_path: Optional[str] = None,
 ) -> CheckResult:
     """Upload the ISO to /shared/images on a standby BIG-IP."""
     result_id = "EXEC-UPLOAD-ISO-001"
@@ -915,7 +916,19 @@ def exec_upload_iso_standby(
     local_size = os.path.getsize(iso_local_path)
     local_sha256 = _sha256_file(iso_local_path)
 
-    command = ["scp", "-O", iso_local_path, destination]
+    command = ["scp", "-O"]
+    if ssh_control_path:
+        command.extend(
+            [
+                "-o",
+                f"ControlPath={ssh_control_path}",
+                "-o",
+                "ControlMaster=auto",
+                "-o",
+                "BatchMode=yes",
+            ]
+        )
+    command.extend([iso_local_path, destination])
 
     print("\nUploading ISO to BIG-IP /shared/images ...")
     print(f"Source: {iso_local_path}")
@@ -954,6 +967,7 @@ def exec_upload_iso_standby(
                 "command": " ".join(command),
                 "returncode": completed.returncode,
                 "elapsed_seconds": round(elapsed, 3),
+                "reused_ssh_controlmaster": bool(ssh_control_path),
             },
         )
 
@@ -1022,6 +1036,7 @@ def exec_upload_iso_standby(
                 "remote_size": remote_size,
                 "sha256": local_sha256,
                 "elapsed_seconds": round(elapsed, 3),
+                "reused_ssh_controlmaster": bool(ssh_control_path),
             },
         )
     except Exception as exc:
@@ -1041,6 +1056,7 @@ def exec_upload_files_standby(
     iso_local_paths: List[str],
     *,
     allow_standalone: bool = False,
+    ssh_control_path: Optional[str] = None,
 ) -> List[CheckResult]:
     """Upload multiple ISO files sequentially, verifying each upload."""
     return [
@@ -1050,6 +1066,7 @@ def exec_upload_files_standby(
             scp_user=scp_user,
             iso_local_path=path,
             allow_standalone=allow_standalone,
+            ssh_control_path=ssh_control_path,
         )
         for path in iso_local_paths
     ]
