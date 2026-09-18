@@ -196,6 +196,13 @@ IMAGE_CHECK_TIMEOUT_SECONDS = 60
 IMAGE_CHECK_MAX_RETRIES = 3
 IMAGE_CHECK_RETRY_DELAY_SECONDS = 10
 
+# Install-submission uses the same fixed internal retry settings as the
+# image check, so a transient icrd/REST outage does not fail the install
+# step outright when SSH fallback can complete it instead.
+INSTALL_SUBMIT_TIMEOUT_SECONDS = 120
+INSTALL_SUBMIT_MAX_RETRIES = 3
+INSTALL_SUBMIT_RETRY_DELAY_SECONDS = 10
+
 
 def check_image_present(
     client: BigIPClient,
@@ -939,8 +946,16 @@ def exec_install_standby(
     *,
     force_install: bool = False,
     create_volume: Optional[bool] = None,
+    ssh_user: Optional[str] = None,
+    ssh_control_path: Optional[str] = None,
 ) -> CheckResult:
-    """Submit image installation to the target standby volume."""
+    """Submit image installation to the target standby volume.
+
+    The install command retries transient REST failures and then falls
+    back to the existing SSH ControlMaster when REST remains unavailable,
+    matching the pattern used for the image-presence check. This prevents
+    a temporary icrd outage from failing the install submission outright.
+    """
     result_id = "EXEC-INSTALL-001"
     result_name = "Install image to standby volume (no reboot)"
 
@@ -1018,7 +1033,16 @@ def exec_install_standby(
     print("Install progress will be monitored in the next step.")
 
     try:
-        response = client.run_bash(tmsh_command, timeout=120)
+        response = _run_bash_with_retry(
+            client,
+            tmsh_command,
+            timeout=INSTALL_SUBMIT_TIMEOUT_SECONDS,
+            max_retries=INSTALL_SUBMIT_MAX_RETRIES,
+            retry_delay=INSTALL_SUBMIT_RETRY_DELAY_SECONDS,
+            ssh_host=client.host if ssh_user else None,
+            ssh_user=ssh_user,
+            ssh_control_path=ssh_control_path,
+        )
         output = _remote_command_output(response)
 
         if _is_fatal_tmsh_output(output):
@@ -1036,6 +1060,10 @@ def exec_install_standby(
                     "tmsh": tmsh_command,
                     "error": "BIG-IP rejected the install command.",
                     "command_result": output,
+                    "ssh_fallback_attempted": bool(ssh_user),
+                    "ssh_fallback_reused_existing_connection": bool(
+                        ssh_control_path
+                    ),
                 },
             )
 
@@ -1053,6 +1081,10 @@ def exec_install_standby(
                 "tmsh": tmsh_command,
                 "note": "Install command submitted. Completion is verified by volume readiness polling.",
                 "command_result": output,
+                "ssh_fallback_attempted": bool(ssh_user),
+                "ssh_fallback_reused_existing_connection": bool(
+                    ssh_control_path
+                ),
             },
         )
     except Exception as exc:
@@ -1069,6 +1101,10 @@ def exec_install_standby(
                 "chosen_volume": target_volume,
                 "tmsh": tmsh_command,
                 "error": str(exc),
+                "ssh_fallback_attempted": bool(ssh_user),
+                "ssh_fallback_reused_existing_connection": bool(
+                    ssh_control_path
+                ),
             },
         )
 

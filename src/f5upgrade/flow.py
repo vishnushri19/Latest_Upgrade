@@ -494,6 +494,8 @@ class UpgradeFlow:
                 self.settings.target_volume,
                 force_install=force_install,
                 create_volume=create_volume,
+                ssh_user=self.settings.scp_user,
+                ssh_control_path=self.ssh_control_path,
             )
         )
         if self.should_stop(results):
