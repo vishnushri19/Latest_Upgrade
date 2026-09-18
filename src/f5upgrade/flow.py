@@ -54,6 +54,10 @@ class UpgradeFlow:
         self._upload_paths: List[str] = []
         self._combined_ehf = False
         self._required_images_present = False
+        # Set only after structured device inventory confirms exactly one
+        # device. This flag is passed explicitly to destructive operations;
+        # an ACTIVE device is never accepted merely because its role is active.
+        self._is_standalone = False
 
     def preflight(self) -> List[CheckResult]:
         """Run and cache all checks that must complete before backups."""
@@ -118,7 +122,6 @@ class UpgradeFlow:
         # that would incorrectly bypass the active/standby lock on a real HA
         # pair whose REST endpoint happens to be flaky. Only trust the
         # device count when the REST payload actually returned "items".
-        is_standalone = False
         device_count: Optional[int] = None
         try:
             payload = self.client.devices()
@@ -130,7 +133,12 @@ class UpgradeFlow:
                 )
             devices = payload.get("items") or []
             device_count = len(devices)
-            is_standalone = device_count <= 1
+            if device_count == 0:
+                raise RuntimeError(
+                    "Device inventory returned zero devices; topology cannot "
+                    "be verified safely."
+                )
+            self._is_standalone = device_count == 1
         except Exception as e:
             # If discovery fails or is unreliable, fail safe: do NOT assume
             # standalone. The existing active/standby lock still applies
@@ -148,7 +156,7 @@ class UpgradeFlow:
                 )
             )
 
-        if is_standalone:
+        if self._is_standalone:
             print(
                 f"\n[i] Device {self.client.host} has no HA peer in its trust domain "
                 f"(device_count={device_count}). Treating as STANDALONE; the "
@@ -181,7 +189,7 @@ class UpgradeFlow:
         #    Skip this lock entirely for standalone devices (no HA peer),
         #    since "active" is the only state such a device can report and
         #    there is no standby to fail over to.
-        if role == "active" and not is_standalone:
+        if role == "active" and not self._is_standalone:
             # Prechecks on active node
             print(f"\n[*] Running prechecks on active node {self.client.host}...")
             precheck_results = run_prechecks(self.client)
@@ -225,7 +233,7 @@ class UpgradeFlow:
         # or the device is a standalone unit where the active/standby lock
         # does not apply.
         print(f"\n" + "=" * 75)
-        if is_standalone:
+        if self._is_standalone:
             print(f"🟢 Target device {self.client.host} is STANDALONE (no HA peer). Proceeding with upgrade execution...")
         else:
             print(f"🟢 Target device {self.client.host} is STANDBY. Proceeding with upgrade execution...")
@@ -350,6 +358,7 @@ class UpgradeFlow:
             ),
             expected_image_contains=self.settings.target_image_contains,
             skip_iso_cleanup=required_images_present,
+            allow_standalone=self._is_standalone,
         )
         results.append(self._storage_result)
         self._preflight_results = results
@@ -381,6 +390,7 @@ class UpgradeFlow:
                 host=self.settings.host,
                 scp_user=self.settings.scp_user,
                 iso_local_paths=upload_paths,
+                allow_standalone=self._is_standalone,
             )
             results.extend(upload_results)
             if self.should_stop(results):
@@ -496,6 +506,7 @@ class UpgradeFlow:
                 create_volume=create_volume,
                 ssh_user=self.settings.scp_user,
                 ssh_control_path=self.ssh_control_path,
+                allow_standalone=self._is_standalone,
             )
         )
         if self.should_stop(results):
@@ -517,6 +528,7 @@ class UpgradeFlow:
             exec_reboot_to_volume_standby(
                 self.client,
                 self.settings.target_volume,
+                allow_standalone=self._is_standalone,
             )
         )
         if self.should_stop(results):
@@ -529,6 +541,7 @@ class UpgradeFlow:
                 expect_version_contains=self.settings.target_image_contains,
                 timeout_sec=self.options.postboot_timeout_sec,
                 interval_sec=self.options.postboot_interval_sec,
+                allow_standalone=self._is_standalone,
             )
         )
 

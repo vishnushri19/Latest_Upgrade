@@ -529,6 +529,21 @@ def _is_hotfix_image(image_name: str) -> bool:
     return os.path.basename(image_name).lower().startswith("hotfix-bigip-")
 
 
+def _execution_role_allowed(role: str, allow_standalone: bool) -> bool:
+    """Allow STANDBY, or ACTIVE only for a topology-verified standalone."""
+    normalized_role = (role or "").strip().lower()
+    return normalized_role == "standby" or (
+        allow_standalone and normalized_role == "active"
+    )
+
+
+def _execution_mode(role: str, allow_standalone: bool) -> str:
+    """Return a human-readable execution mode for evidence and messages."""
+    if allow_standalone and (role or "").strip().lower() == "active":
+        return "standalone"
+    return "ha-standby"
+
+
 def prepare_install_storage(
     client: BigIPClient,
     target_volume: str,
@@ -536,6 +551,7 @@ def prepare_install_storage(
     require_upload_space: bool,
     expected_image_contains: str = "",
     skip_iso_cleanup: bool = False,
+    allow_standalone: bool = False,
 ) -> CheckResult:
     """Display storage state and safely prepare an inactive target volume."""
     result_id = "EXEC-STORAGE-001"
@@ -553,14 +569,24 @@ def prepare_install_storage(
             details={"error": f"Could not determine failover role: {exc}"},
         )
 
-    if role != "standby":
+    if not _execution_role_allowed(role, allow_standalone):
         return CheckResult(
             id=result_id,
             category="Execution Readiness",
             name=result_name,
             status="FAIL",
-            details={"error": "Storage preparation requires a STANDBY device.", "role": role},
+            details={
+                "error": (
+                    "Storage preparation requires an HA STANDBY device or "
+                    "a topology-verified standalone device."
+                ),
+                "role": role,
+                "allow_standalone": allow_standalone,
+            },
         )
+
+    details["role"] = role
+    details["execution_mode"] = _execution_mode(role, allow_standalone)
 
     if skip_iso_cleanup:
         print(
@@ -767,19 +793,28 @@ def exec_upload_iso_standby(
     host: str,
     scp_user: str,
     iso_local_path: str,
+    *,
+    allow_standalone: bool = False,
 ) -> CheckResult:
     """Upload the ISO to /shared/images on a standby BIG-IP."""
     result_id = "EXEC-UPLOAD-ISO-001"
     result_name = "Upload ISO to /shared/images (standby only)"
 
     role = (get_failover_role(client) or "").lower()
-    if role != "standby":
+    if not _execution_role_allowed(role, allow_standalone):
         return CheckResult(
             id=result_id,
             category="Execution",
             name=result_name,
             status="FAIL",
-            details={"error": "Refusing upload because device is not STANDBY.", "role": role},
+            details={
+                "error": (
+                    "Refusing upload because the device is neither HA "
+                    "STANDBY nor a topology-verified standalone device."
+                ),
+                "role": role,
+                "allow_standalone": allow_standalone,
+            },
         )
 
     if not iso_local_path:
@@ -931,10 +966,18 @@ def exec_upload_files_standby(
     host: str,
     scp_user: str,
     iso_local_paths: List[str],
+    *,
+    allow_standalone: bool = False,
 ) -> List[CheckResult]:
     """Upload multiple ISO files sequentially, verifying each upload."""
     return [
-        exec_upload_iso_standby(client, host=host, scp_user=scp_user, iso_local_path=path)
+        exec_upload_iso_standby(
+            client,
+            host=host,
+            scp_user=scp_user,
+            iso_local_path=path,
+            allow_standalone=allow_standalone,
+        )
         for path in iso_local_paths
     ]
 
@@ -948,6 +991,7 @@ def exec_install_standby(
     create_volume: Optional[bool] = None,
     ssh_user: Optional[str] = None,
     ssh_control_path: Optional[str] = None,
+    allow_standalone: bool = False,
 ) -> CheckResult:
     """Submit image installation to the target standby volume.
 
@@ -960,13 +1004,20 @@ def exec_install_standby(
     result_name = "Install image to standby volume (no reboot)"
 
     role = (get_failover_role(client) or "").lower()
-    if role != "standby":
+    if not _execution_role_allowed(role, allow_standalone):
         return CheckResult(
             id=result_id,
             category="Execution",
             name=result_name,
             status="FAIL",
-            details={"error": "Refusing install because device is not STANDBY.", "role": role},
+            details={
+                "error": (
+                    "Refusing install because the device is neither HA "
+                    "STANDBY nor a topology-verified standalone device."
+                ),
+                "role": role,
+                "allow_standalone": allow_standalone,
+            },
         )
 
     expected_version = _extract_version_from_image_name(image_iso_name)
@@ -1203,23 +1254,37 @@ def _is_expected_reboot_disconnect(error: Exception) -> bool:
     return any(marker in text for marker in ("remotedisconnected", "remote end closed connection", "connection aborted", "connection reset", "badstatusline"))
 
 
-def exec_reboot_to_volume_standby(client: BigIPClient, volume: str) -> CheckResult:
+def exec_reboot_to_volume_standby(
+    client: BigIPClient,
+    volume: str,
+    *,
+    allow_standalone: bool = False,
+) -> CheckResult:
     """Reboot the standby BIG-IP into the target volume."""
     result_id = "EXEC-REBOOT-TO-VOL-001"
     result_name = "Reboot to target volume (standby only)"
 
     role = (get_failover_role(client) or "").lower()
-    if role != "standby":
+    if not _execution_role_allowed(role, allow_standalone):
         return CheckResult(
             id=result_id,
             category="Execution",
             name=result_name,
             status="FAIL",
-            details={"error": "Refusing reboot because device is not STANDBY.", "role": role, "volume": volume},
+            details={
+                "error": (
+                    "Refusing reboot because the device is neither HA "
+                    "STANDBY nor a topology-verified standalone device."
+                ),
+                "role": role,
+                "volume": volume,
+                "allow_standalone": allow_standalone,
+            },
         )
 
     tmsh_command = f"tmsh reboot volume {volume}"
-    print(f"\nRebooting STANDBY device into target volume {volume}.")
+    mode = _execution_mode(role, allow_standalone)
+    print(f"\nRebooting {mode.upper()} device into target volume {volume}.")
     print(tmsh_command)
 
     try:
@@ -1254,8 +1319,9 @@ def exec_wait_postboot(
     expect_version_contains: str,
     timeout_sec: int = 900,
     interval_sec: int = 15,
+    allow_standalone: bool = False,
 ) -> CheckResult:
-    """Wait until the device is reachable after reboot, is running the expected version, and is back in STANDBY."""
+    """Validate version and the expected HA-standby or standalone role."""
     result_id = "VAL-POSTBOOT-001"
     result_name = "Post-boot validation"
     deadline = time.time() + timeout_sec
@@ -1276,15 +1342,27 @@ def exec_wait_postboot(
 
             if expect_version_contains and expect_version_contains not in version_text:
                 last_error = "Version does not match expectation yet."
-            elif (role or "").lower() != "standby":
-                last_error = f"Device is not STANDBY yet. Current role: {role}"
+            elif not _execution_role_allowed(role or "", allow_standalone):
+                expected_role = "ACTIVE (standalone)" if allow_standalone else "STANDBY"
+                last_error = (
+                    f"Device is not in the expected {expected_role} role yet. "
+                    f"Current role: {role}"
+                )
             else:
+                mode = _execution_mode(role or "", allow_standalone)
                 return CheckResult(
                     id=result_id,
                     category="Validation",
                     name=result_name,
                     status="PASS",
-                    details={"note": "Device is reachable with the expected version and standby role.", **last_seen},
+                    details={
+                        "note": (
+                            "Device is reachable with the expected version "
+                            f"and valid {mode} role."
+                        ),
+                        "execution_mode": mode,
+                        **last_seen,
+                    },
                 )
         except requests.exceptions.RequestException as exc:
             last_error = str(exc)
