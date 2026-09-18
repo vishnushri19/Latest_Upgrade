@@ -349,6 +349,20 @@ class DiffEngine:
             f"| BGP route domain 0 | {self._bgp_state(diff_result, 'pre')} | {self._bgp_state(diff_result, 'post')} | {self._comparison_result(self._bgp_state(diff_result, 'pre'), self._bgp_state(diff_result, 'post'))} |",
             f"| BGP neighbors | {self._bgp_neighbors(diff_result, 'pre')} | {self._bgp_neighbors(diff_result, 'post')} | {self._comparison_result(self._bgp_neighbors(diff_result, 'pre'), self._bgp_neighbors(diff_result, 'post'))} |",
             "",
+        ])
+        lines.extend(
+            self._bgp_markdown(
+                diff_result.get("bgp_inventory", {}).get("pre", {}),
+                diff_result.get("bgp_inventory", {}).get("post", {}),
+            )
+        )
+        lines.extend(
+            self._crypto_markdown(
+                diff_result.get("crypto_inventory", {}).get("pre", {}),
+                diff_result.get("crypto_inventory", {}).get("post", {}),
+            )
+        )
+        lines.extend([
             "## Differences Requiring Action",
         ])
         if object_critical:
