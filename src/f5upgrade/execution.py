@@ -213,34 +213,37 @@ def check_image_present(
 ) -> ImagePresenceResult:
     """Verify that the ISO exists under /shared/images.
 
-    The filesystem check retries transient REST failures and then uses the
-    existing SSH ControlMaster when REST remains unavailable. This prevents a
-    temporary icrd outage from reporting a present image as missing.
+    The filesystem check prefers an existing SSH ControlMaster and retains
+    REST as a fallback. This prevents a temporary icrd outage from reporting
+    a present image as missing.
     """
     needle = (image_name_contains or "").strip().lower()
     available_images = []
     rest_error = ""
 
-    try:
-        payload = client.software_images()
-        items = payload.get("items", []) if isinstance(payload, dict) else []
-        available_images = [
-            str(item.get("name"))
-            for item in items
-            if isinstance(item, dict) and item.get("name")
-        ]
-    except Exception as exc:
-        available_images = []
-        rest_error = f"{type(exc).__name__}: {exc}"
+    # When an authenticated ControlMaster exists, the filesystem listing
+    # below is authoritative. Avoid an unnecessary REST inventory request
+    # that can time out while BIG-IP is busy.
+    if not (ssh_user and ssh_control_path):
+        try:
+            payload = client.software_images()
+            items = payload.get("items", []) if isinstance(payload, dict) else []
+            available_images = [
+                str(item.get("name"))
+                for item in items
+                if isinstance(item, dict) and item.get("name")
+            ]
+        except Exception as exc:
+            available_images = []
+            rest_error = f"{type(exc).__name__}: {exc}"
 
     try:
-        response = _run_bash_with_retry(
+        response = _run_readonly_bash_prefer_ssh(
             client,
             "ls -1 /shared/images/ 2>/dev/null | head -n 500",
             timeout=IMAGE_CHECK_TIMEOUT_SECONDS,
             max_retries=IMAGE_CHECK_MAX_RETRIES,
             retry_delay=IMAGE_CHECK_RETRY_DELAY_SECONDS,
-            ssh_host=client.host if ssh_user else None,
             ssh_user=ssh_user,
             ssh_control_path=ssh_control_path,
         )
@@ -410,6 +413,44 @@ def _run_bash_with_retry(
     raise RuntimeError("Unreachable: run_bash retry loop exited without a result.")
 
 
+def _run_readonly_bash_prefer_ssh(
+    client: BigIPClient,
+    command: str,
+    *,
+    timeout: int,
+    max_retries: int,
+    retry_delay: int,
+    ssh_user: Optional[str] = None,
+    ssh_control_path: Optional[str] = None,
+) -> Any:
+    """Use an authenticated SSH master first for read-only shell commands."""
+    if ssh_user and ssh_control_path:
+        try:
+            return _run_bash_via_ssh(
+                client.host,
+                ssh_user,
+                command,
+                timeout=timeout,
+                control_path=ssh_control_path,
+            )
+        except Exception as ssh_exc:
+            print(
+                "\n[i] Authenticated SSH read failed; falling back to "
+                f"iControl REST: {type(ssh_exc).__name__}: {ssh_exc}"
+            )
+
+    return _run_bash_with_retry(
+        client,
+        command,
+        timeout=timeout,
+        max_retries=max_retries,
+        retry_delay=retry_delay,
+        ssh_host=client.host if ssh_user else None,
+        ssh_user=ssh_user,
+        ssh_control_path=ssh_control_path,
+    )
+
+
 def _is_ambiguous_submission_error(error: Exception) -> bool:
     """Return True when BIG-IP may have accepted a timed-out REST request."""
     if isinstance(
@@ -501,16 +542,17 @@ def check_license_dates(
 
     print("\n[LIC-001] Validating ISO license-check date...")
     print(f"Image: {image_name}")
+    if ssh_user and ssh_control_path:
+        print("Validation transport: authenticated SSH ControlMaster")
 
     try:
-        version_response = _run_bash_with_retry(
+        version_response = _run_readonly_bash_prefer_ssh(
             client,
             "isoinfo -f -R -i "
             f"{_shell_quote(remote_iso)} | grep -m1 'version_date'",
             timeout=timeout,
             max_retries=max_retries,
             retry_delay=retry_delay,
-            ssh_host=ssh_host,
             ssh_user=ssh_user,
             ssh_control_path=ssh_control_path,
         )
@@ -526,14 +568,13 @@ def check_license_dates(
             raise ValueError("ISO version_date entry was not found.")
 
         stage = "ISO license-check date read"
-        date_response = _run_bash_with_retry(
+        date_response = _run_readonly_bash_prefer_ssh(
             client,
             "isoinfo -R -i "
             f"{_shell_quote(remote_iso)} -x {_shell_quote(version_path)}",
             timeout=timeout,
             max_retries=max_retries,
             retry_delay=retry_delay,
-            ssh_host=ssh_host,
             ssh_user=ssh_user,
             ssh_control_path=ssh_control_path,
         )
@@ -542,13 +583,12 @@ def check_license_dates(
             raise ValueError("ISO license-check date was not found.")
 
         stage = "service-check date read"
-        service_response = _run_bash_with_retry(
+        service_response = _run_readonly_bash_prefer_ssh(
             client,
             "grep -F 'Service check date' /config/bigip.license",
             timeout=timeout,
             max_retries=max_retries,
             retry_delay=retry_delay,
-            ssh_host=ssh_host,
             ssh_user=ssh_user,
             ssh_control_path=ssh_control_path,
         )
