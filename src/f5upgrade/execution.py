@@ -190,15 +190,11 @@ def _sha256_file(path: str) -> str:
     return digest.hexdigest()
 
 
-IMAGE_CHECK_TIMEOUT_SECONDS = int(
-    os.environ.get("IMAGE_CHECK_TIMEOUT_SECONDS", "60")
-)
-IMAGE_CHECK_MAX_RETRIES = int(
-    os.environ.get("IMAGE_CHECK_MAX_RETRIES", "3")
-)
-IMAGE_CHECK_RETRY_DELAY_SECONDS = int(
-    os.environ.get("IMAGE_CHECK_RETRY_DELAY_SECONDS", "10")
-)
+# Image checks use fixed internal retry settings so customer deployments do
+# not need additional environment variables.
+IMAGE_CHECK_TIMEOUT_SECONDS = 60
+IMAGE_CHECK_MAX_RETRIES = 3
+IMAGE_CHECK_RETRY_DELAY_SECONDS = 10
 
 
 def check_image_present(
