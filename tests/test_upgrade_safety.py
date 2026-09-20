@@ -91,9 +91,11 @@ class StandaloneTopologyTests(unittest.TestCase):
         )
         flow = UpgradeFlow(client=client, settings=settings)
 
+        output = io.StringIO()
         with (
             patch("f5upgrade.flow.get_failover_role", return_value="active"),
             patch("f5upgrade.flow.run_prechecks", return_value=[]),
+            redirect_stdout(output),
         ):
             results = flow.preflight()
 
@@ -101,6 +103,10 @@ class StandaloneTopologyTests(unittest.TestCase):
         result_ids = {result.id for result in results}
         self.assertIn("FLOW-STANDALONE-001", result_ids)
         self.assertIn("FLOW-SKIP-002", result_ids)
+        text = output.getvalue()
+        self.assertIn("src/f5upgrade/bigip_client.py:BigIPClient.devices", text)
+        self.assertIn("FLOW-SKIP-002 FAIL", text)
+        self.assertIn("[ISSUE] FLOW-SKIP-002", text)
 
 
 class ScpControlMasterTests(unittest.TestCase):
