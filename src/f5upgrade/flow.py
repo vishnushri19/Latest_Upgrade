@@ -20,6 +20,7 @@ from .execution import (
 )
 from .ha import get_failover_role
 from .report import CheckResult
+from .trace import trace_call, trace_check
 
 
 @dataclass(frozen=True)
@@ -68,6 +69,7 @@ class UpgradeFlow:
 
         # --- Version + role discovery (for idempotence and safety) ---
         version_str = ""
+        trace_call("src/f5upgrade/flow.py:UpgradeFlow.preflight", "src/f5upgrade/bigip_client.py:BigIPClient.system_version", "Read current software version")
         try:
             ver_payload = self.client.system_version()
             version_str = str(ver_payload)
@@ -88,10 +90,12 @@ class UpgradeFlow:
                     details={"error": "Could not determine system version via REST or TMSH."},
                 )
             )
+            trace_check("src/f5upgrade/flow.py:UpgradeFlow.preflight", results[-1])
             if self.should_stop(results):
                 self._preflight_results = results
                 return list(results)
 
+        trace_call("src/f5upgrade/flow.py:UpgradeFlow.preflight", "src/f5upgrade/ha.py:get_failover_role", "Read current failover role")
         try:
             role = (get_failover_role(self.client) or "").lower()
         except Exception as e:
@@ -105,6 +109,7 @@ class UpgradeFlow:
                     details={"error": str(e)},
                 )
             )
+            trace_check("src/f5upgrade/ha.py:get_failover_role", results[-1])
             if self.should_stop(results):
                 self._preflight_results = results
                 return list(results)
@@ -123,6 +128,7 @@ class UpgradeFlow:
         # pair whose REST endpoint happens to be flaky. Only trust the
         # device count when the REST payload actually returned "items".
         device_count: Optional[int] = None
+        trace_call("src/f5upgrade/flow.py:UpgradeFlow.preflight", "src/f5upgrade/bigip_client.py:BigIPClient.devices", "Verify standalone or HA topology from structured device inventory")
         try:
             payload = self.client.devices()
             if not isinstance(payload, dict) or "items" not in payload:
@@ -155,6 +161,7 @@ class UpgradeFlow:
                     },
                 )
             )
+            trace_check("src/f5upgrade/flow.py:UpgradeFlow.preflight", results[-1])
 
         if self._is_standalone:
             print(
@@ -182,6 +189,7 @@ class UpgradeFlow:
                     },
                 )
             )
+            trace_check("src/f5upgrade/flow.py:UpgradeFlow.preflight", results[-1])
             self._preflight_results = results
             return list(results)
 
@@ -192,8 +200,11 @@ class UpgradeFlow:
         if role == "active" and not self._is_standalone:
             # Prechecks on active node
             print(f"\n[*] Running prechecks on active node {self.client.host}...")
+            trace_call("src/f5upgrade/flow.py:UpgradeFlow.preflight", "src/f5upgrade/checks.py:run_prechecks", "Run safety checks on HA active device")
             precheck_results = run_prechecks(self.client)
             results.extend(precheck_results)
+            for result in precheck_results:
+                trace_check("src/f5upgrade/checks.py:run_prechecks", result)
             if self.should_stop(results):
                 self._preflight_results = results
                 return list(results)
@@ -226,6 +237,7 @@ class UpgradeFlow:
                     },
                 )
             )
+            trace_check("src/f5upgrade/flow.py:UpgradeFlow.preflight", results[-1])
             self._preflight_results = results
             return list(results)
 
@@ -240,8 +252,11 @@ class UpgradeFlow:
         print("=" * 75)
 
         # --- Prechecks (always run before upgrade) ---
+        trace_call("src/f5upgrade/flow.py:UpgradeFlow.preflight", "src/f5upgrade/checks.py:run_prechecks", "Run platform, configuration, HA, rollback, and license reachability checks")
         precheck_results = run_prechecks(self.client)
         results.extend(precheck_results)
+        for result in precheck_results:
+            trace_check("src/f5upgrade/checks.py:run_prechecks", result)
         if self.should_stop(results):
             self._preflight_results = results
             return list(results)
@@ -263,6 +278,7 @@ class UpgradeFlow:
         try:
             from .discovery import discover_devices
 
+            trace_call("src/f5upgrade/flow.py:UpgradeFlow.preflight", "src/f5upgrade/discovery.py:discover_devices", "Discover trust-domain devices")
             local_name, devices = discover_devices(self.client)
             results.append(
                 CheckResult(
@@ -287,12 +303,16 @@ class UpgradeFlow:
                     details={"error": str(e)},
                 )
             )
+            trace_check("src/f5upgrade/discovery.py:discover_devices", results[-1])
             self._preflight_results = results
             return list(results)
+
+        trace_check("src/f5upgrade/discovery.py:discover_devices", results[-1])
 
         try:
             from .mgmt import resolve_management_addresses
 
+            trace_call("src/f5upgrade/flow.py:UpgradeFlow.preflight", "src/f5upgrade/mgmt.py:resolve_management_addresses", "Resolve management addresses")
             mgmt_list = resolve_management_addresses(self.client)
             results.append(
                 CheckResult(
@@ -316,8 +336,11 @@ class UpgradeFlow:
                     details={"error": str(e)},
                 )
             )
+            trace_check("src/f5upgrade/mgmt.py:resolve_management_addresses", results[-1])
             self._preflight_results = results
             return list(results)
+
+        trace_check("src/f5upgrade/mgmt.py:resolve_management_addresses", results[-1])
 
         # --- Storage and target-volume safety ---
         self._combined_ehf = bool(
@@ -338,6 +361,7 @@ class UpgradeFlow:
         ]
         required_images_present = bool(expected_names)
         for image_name in expected_names:
+            trace_call("src/f5upgrade/flow.py:UpgradeFlow.preflight", "src/f5upgrade/execution.py:check_image_present", "Check required ISO presence")
             image = check_image_present(
                 self.client,
                 image_name,
@@ -348,6 +372,7 @@ class UpgradeFlow:
         if not expected_names:
             required_images_present = True
         self._required_images_present = required_images_present
+        trace_call("src/f5upgrade/flow.py:UpgradeFlow.preflight", "src/f5upgrade/execution.py:prepare_install_storage", "Check upload space and target volume; request confirmation for cleanup if required")
         self._storage_result = prepare_install_storage(
             self.client,
             self.settings.target_volume,
@@ -361,6 +386,7 @@ class UpgradeFlow:
             allow_standalone=self._is_standalone,
         )
         results.append(self._storage_result)
+        trace_check("src/f5upgrade/execution.py:prepare_install_storage", self._storage_result)
         self._preflight_results = results
         return list(results)
 
@@ -385,6 +411,7 @@ class UpgradeFlow:
             and upload_paths
             and not self._required_images_present
         ):
+            trace_call("src/f5upgrade/flow.py:UpgradeFlow.run", "src/f5upgrade/execution.py:exec_upload_files_standby", "Upload required ISO files")
             upload_results = exec_upload_files_standby(
                 self.client,
                 host=self.settings.host,
@@ -394,6 +421,8 @@ class UpgradeFlow:
                 ssh_control_path=self.ssh_control_path,
             )
             results.extend(upload_results)
+            for result in upload_results:
+                trace_check("src/f5upgrade/execution.py:exec_upload_files_standby", result)
             if self.should_stop(results):
                 return results
         elif self._required_images_present:
@@ -408,6 +437,7 @@ class UpgradeFlow:
         ]
         if combined_ehf:
             expected_names = [expected_names[-1]]
+        trace_call("src/f5upgrade/flow.py:UpgradeFlow.run", "src/f5upgrade/execution.py:check_image_present", "Verify target ISO exists on BIG-IP")
         img = check_image_present(
             self.client,
             expected_names[0]
@@ -444,6 +474,7 @@ class UpgradeFlow:
                 details=img.details,
             )
         )
+        trace_check("src/f5upgrade/execution.py:check_image_present", results[-1])
         if not img.found or self.should_stop(results):
             return results
 
@@ -452,6 +483,7 @@ class UpgradeFlow:
             if combined_ehf
             else (img.matched_name or "")
         )
+        trace_call("src/f5upgrade/flow.py:UpgradeFlow.run", "src/f5upgrade/execution.py:check_license_dates", "Compare ISO license-check date with device service-check date")
         license_result = check_license_dates(
             self.client,
             license_image_name,
@@ -462,6 +494,7 @@ class UpgradeFlow:
             ssh_control_path=self.ssh_control_path,
         )
         results.append(license_result)
+        trace_check("src/f5upgrade/execution.py:check_license_dates", license_result)
         if self.should_stop(results):
             return results
 
@@ -499,53 +532,57 @@ class UpgradeFlow:
         )
 
         # Install to target volume (standby only)
-        results.append(
-            exec_install_standby(
-                self.client,
-                install_name,
-                self.settings.target_volume,
-                force_install=force_install,
-                create_volume=create_volume,
-                ssh_user=self.settings.scp_user,
-                ssh_control_path=self.ssh_control_path,
-                allow_standalone=self._is_standalone,
-            )
+        trace_call("src/f5upgrade/flow.py:UpgradeFlow.run", "src/f5upgrade/execution.py:exec_install_standby", "Submit software installation to target volume")
+        install_result = exec_install_standby(
+            self.client,
+            install_name,
+            self.settings.target_volume,
+            force_install=force_install,
+            create_volume=create_volume,
+            ssh_user=self.settings.scp_user,
+            ssh_control_path=self.ssh_control_path,
+            allow_standalone=self._is_standalone,
         )
+        results.append(install_result)
+        trace_check("src/f5upgrade/execution.py:exec_install_standby", install_result)
         if self.should_stop(results):
             return results
 
         # Wait for volume completion
-        results.append(
-            exec_volume_ready(
-                self.client,
-                self.settings.target_volume,
-                self.settings.target_image_contains,
-            )
+        trace_call("src/f5upgrade/flow.py:UpgradeFlow.run", "src/f5upgrade/execution.py:exec_volume_ready", "Wait for target volume installation to complete")
+        volume_result = exec_volume_ready(
+            self.client,
+            self.settings.target_volume,
+            self.settings.target_image_contains,
         )
+        results.append(volume_result)
+        trace_check("src/f5upgrade/execution.py:exec_volume_ready", volume_result)
         if self.should_stop(results):
             return results
 
         # Reboot to target volume
-        results.append(
-            exec_reboot_to_volume_standby(
-                self.client,
-                self.settings.target_volume,
-                allow_standalone=self._is_standalone,
-            )
+        trace_call("src/f5upgrade/flow.py:UpgradeFlow.run", "src/f5upgrade/execution.py:exec_reboot_to_volume_standby", "Reboot into target volume")
+        reboot_result = exec_reboot_to_volume_standby(
+            self.client,
+            self.settings.target_volume,
+            allow_standalone=self._is_standalone,
         )
+        results.append(reboot_result)
+        trace_check("src/f5upgrade/execution.py:exec_reboot_to_volume_standby", reboot_result)
         if self.should_stop(results):
             return results
 
         # Post-boot validation (device reachable, version matches, role ok)
-        results.append(
-            exec_wait_postboot(
-                self.client,
-                expect_version_contains=self.settings.target_image_contains,
-                timeout_sec=self.options.postboot_timeout_sec,
-                interval_sec=self.options.postboot_interval_sec,
-                allow_standalone=self._is_standalone,
-            )
+        trace_call("src/f5upgrade/flow.py:UpgradeFlow.run", "src/f5upgrade/execution.py:exec_wait_postboot", "Validate version and role after reboot")
+        postboot_result = exec_wait_postboot(
+            self.client,
+            expect_version_contains=self.settings.target_image_contains,
+            timeout_sec=self.options.postboot_timeout_sec,
+            interval_sec=self.options.postboot_interval_sec,
+            allow_standalone=self._is_standalone,
         )
+        results.append(postboot_result)
+        trace_check("src/f5upgrade/execution.py:exec_wait_postboot", postboot_result)
 
         return results
 

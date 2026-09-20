@@ -16,6 +16,7 @@ from f5upgrade.flow import FlowOptions, UpgradeFlow
 from f5upgrade.ha import manage_auto_sync
 from f5upgrade.report import to_report, write_json, write_markdown
 from f5upgrade.state_collector import StateCollector
+from f5upgrade.trace import trace_call
 
 from run_backup_artifacts import SSHSession, _run_backup_task
 
@@ -592,6 +593,7 @@ def main() -> int:
         "\n[PREFLIGHT] Validating standby role, configuration, discovery, "
         "storage, and target-volume readiness..."
     )
+    trace_call("scripts/run_upgrade_node.py:main", "src/f5upgrade/flow.py:UpgradeFlow.preflight", "Check topology, configuration, image, storage, and target volume")
     preflight_results = flow.preflight()
     if flow.should_stop(preflight_results):
         report = to_report(
@@ -634,6 +636,7 @@ def main() -> int:
         / f"pre_state_{safe_host}.xlsx"
     )
 
+    trace_call("scripts/run_upgrade_node.py:main", "src/f5upgrade/state_collector.py:StateCollector.collect_all_state", "Capture pre-upgrade state")
     pre_state = collector.collect_all_state()
     collector.save_operational_evidence(pre_state, output_dir)
 
@@ -670,6 +673,7 @@ def main() -> int:
         f"{node_count} Nodes."
     )
 
+    trace_call("scripts/run_upgrade_node.py:main", "src/f5upgrade/ha.py:manage_auto_sync", "Check and, if approved, disable auto-sync")
     auto_sync_groups = manage_auto_sync(
         client,
         enable=False,
@@ -681,6 +685,7 @@ def main() -> int:
 
     print("\n[*] Saving all partition configuration before backups...")
     try:
+        trace_call("scripts/run_upgrade_node.py:main", "src/f5upgrade/state_collector.py:StateCollector.save_configuration_partitions", "Save running configuration")
         save_output = collector.save_configuration_partitions()
         print(f"[+] Configuration saved before backups: {save_output or 'PASS'}")
     except RuntimeError as exc:
@@ -707,9 +712,11 @@ def main() -> int:
             settings.password if scp_user == settings.username else None
         ),
     )
+    trace_call("scripts/run_upgrade_node.py:main", "scripts/run_backup_artifacts.py:SSHSession.open", "Open shared SSH connection for backups and ISO checks")
     ssh_session.open()
     flow.ssh_control_path = ssh_session.control_path
 
+    trace_call("scripts/run_upgrade_node.py:main", "scripts/run_upgrade_node.py:create_and_download_backups", "Create and download backup artifacts")
     backups_ok = create_and_download_backups(
         client=client,
         settings=settings,
@@ -733,6 +740,7 @@ def main() -> int:
     StateCollector(client).display_ltm_health_summary()
 
     try:
+        trace_call("scripts/run_upgrade_node.py:main", "src/f5upgrade/flow.py:UpgradeFlow.run", "Upload or reuse image, validate license, install, and reboot")
         results = flow.run()
     finally:
         # The LIC-001 SSH fallback (if it ran) was the last consumer of the
@@ -826,6 +834,7 @@ def main() -> int:
     print("\n[+] Stabilization wait completed.")
     StateCollector(client).display_ltm_health_summary()
 
+    trace_call("scripts/run_upgrade_node.py:main", "src/f5upgrade/ha.py:manage_auto_sync", "Check and, if approved, restore auto-sync")
     manage_auto_sync(
         client,
         enable=True,
@@ -848,6 +857,7 @@ def main() -> int:
     )
 
     collector.phase = "post"
+    trace_call("scripts/run_upgrade_node.py:main", "src/f5upgrade/state_collector.py:StateCollector.collect_all_state", "Capture post-upgrade state")
     post_state = collector.collect_all_state()
     collector.save_operational_evidence(post_state, output_dir)
 
@@ -878,6 +888,7 @@ def main() -> int:
         post_state,
     )
 
+    trace_call("scripts/run_upgrade_node.py:main", "src/f5upgrade/diff_engine.py:DiffEngine.compare", "Compare pre-upgrade and post-upgrade state")
     diff_results = engine.compare()
 
     diff_json = (
